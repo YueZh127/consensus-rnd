@@ -155,6 +155,8 @@ RUNNER_NAMED_HELPER_ACTIONS = {
     "publish_release_candidate",
     "apply_issue_decomposition_plan",
     "apply_default_issue_intake_claim",
+    "run_host_product_quality_loop_test_asset_design",
+    "run_host_product_quality_loop_product_bug_issue",
 }
 RELEASE_ROLLUP_BODY_FILE = ".refactor-loop/runs/release-rollup-pr-body.md"
 RELEASE_ROLLUP_BODY_PROMPT = ".refactor-loop/prompts/release-rollup-body.md"
@@ -210,6 +212,7 @@ EXECUTABLE_ACTION_KINDS = {
     "default-issue-intake-claim",
     "resume-requested-consensus-implementation",
     "defer-false-positive-consensus",
+    "host-workflow-action",
 }
 NON_ACTION_PHASE_LABELS = {
     label_catalog.PHASE_PR_OPEN: "pr-open",
@@ -343,10 +346,58 @@ def load_host_workflow_projection(repo_root: Path) -> tuple[list[dict[str, Any]]
             "status": event.status,
             "route": "host-workflow-status-projection",
             "no_lifecycle_authority": True,
+            "status_only": True,
         }
         for event in spec.events
     ]
+    actions.extend(_host_wakeup_plan_action_projection(spec))
     return actions, None
+
+
+def _host_wakeup_plan_action_projection(spec: Any) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for host_action in getattr(spec, "wakeup_plan_actions", ()):
+        preconditions = list(getattr(host_action, "preconditions", ()) or ())
+        if "host_workflow_spec_validated" not in preconditions:
+            preconditions.append("host_workflow_spec_validated")
+        actions.append(
+            {
+                "priority": 8,
+                "kind": "host-workflow-action",
+                "action_id": f"host-workflow-action:{host_action.name}",
+                "item": host_action.name,
+                "phase": host_action.stage,
+                "actor": "controller",
+                "route": "host-workflow-allowlist-action",
+                "event": host_action.event,
+                "prompt_binding": host_action.prompt_binding,
+                "interval_seconds": host_action.interval_seconds,
+                "controller_action": host_action.controller_action,
+                "target_kind": "host",
+                "target_number": None,
+                "target": {"kind": "host", "item": host_action.name},
+                "preconditions": preconditions,
+                "runner_authority": RUNNER_AUTHORITY,
+                "no_generic_command": True,
+                "no_lifecycle_authority": True,
+                "source_artifact": _host_workflow_source_artifact(spec),
+                "source_marker": host_action.name,
+            }
+        )
+    return actions
+
+
+def _host_workflow_source_artifact(spec: Any) -> str:
+    source_path = getattr(spec, "source_path", None)
+    if not isinstance(source_path, Path):
+        return "HOST_WORKFLOW_SPEC"
+    try:
+        repo_root = Path(os.environ.get("REPO_ROOT") or "").resolve()
+        if str(repo_root):
+            return source_path.resolve().relative_to(repo_root).as_posix()
+    except (OSError, ValueError):
+        pass
+    return source_path.name
 
 
 def _canonical_in_flight_for_log(log_path: Path, monitor: Any | None) -> bool:

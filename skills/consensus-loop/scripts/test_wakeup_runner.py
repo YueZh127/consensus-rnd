@@ -241,6 +241,17 @@ class FakeActions:
         self.calls.append(("apply_issue_decomposition_plan", plan_path))
         return ((501, "https://github.com/owner/repo/issues/501"),)
 
+    @property
+    def integration_branch(self) -> str:
+        return "main"
+
+    def safe_worktree(self, iteration: str, cluster: str, base: str) -> tuple[Path, str]:
+        worktree = Path(self.repo if hasattr(self, "repo") else tempfile.mkdtemp()) / ".worktrees" / f"iter{iteration}-{cluster}"
+        worktree.mkdir(parents=True, exist_ok=True)
+        branch = f"refactor/iter{iteration}-{cluster}"
+        self.calls.append(("safe_worktree", {"iteration": iteration, "cluster": cluster, "base": base, "worktree": str(worktree), "branch": branch}))
+        return worktree, branch
+
     def apply_default_issue_intake_claim(self, issue_number: int):
         self.calls.append(("apply_default_issue_intake_claim", issue_number))
         return None
@@ -1236,6 +1247,273 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             "actions": [self.annotate_safe_progress(action)],
             "blocked_queue": [],
         }
+
+
+    def pql_test_asset_action(self, **overrides) -> dict:
+        action = {
+            "kind": "host-workflow-action",
+            "action_id": "host-workflow-action:host:product-quality-loop-test-asset-design",
+            "runner_authority": "wakeup-runner-396",
+            "preconditions": ["active_controller_owner", "host_workflow_spec_validated", "pql_test_design_handoff_ready"],
+            "source_artifact": "workflow.json",
+            "source_marker": "host:product-quality-loop-test-asset-design",
+            "target_kind": "host",
+            "target_number": None,
+            "target": {"kind": "host", "item": "host:product-quality-loop-test-asset-design"},
+            "item": "host:product-quality-loop-test-asset-design",
+            "controller_action": "run_host_product_quality_loop_test_asset_design",
+            "no_generic_command": True,
+            "no_lifecycle_authority": True,
+        }
+        action.update(overrides)
+        return action
+
+    def pql_product_bug_action(self, **overrides) -> dict:
+        action = {
+            "kind": "host-workflow-action",
+            "action_id": "host-workflow-action:host:product-quality-loop-product-bug-issue",
+            "runner_authority": "wakeup-runner-396",
+            "preconditions": ["active_controller_owner", "host_workflow_spec_validated", "pql_product_bug_handoff_ready"],
+            "source_artifact": "workflow.json",
+            "source_marker": "host:product-quality-loop-product-bug-issue",
+            "target_kind": "host",
+            "target_number": None,
+            "target": {"kind": "host", "item": "host:product-quality-loop-product-bug-issue"},
+            "item": "host:product-quality-loop-product-bug-issue",
+            "controller_action": "run_host_product_quality_loop_product_bug_issue",
+            "no_generic_command": True,
+            "no_lifecycle_authority": True,
+        }
+        action.update(overrides)
+        return action
+
+    def configure_product_quality_loop_context(self, *, product_bug_allowlist: str = "aevatarAI/aevatar", gh_repo_slug: str = "owner/repo") -> None:
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / ".config" / "consensus-rnd").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".config/consensus-rnd/host.env").write_text(
+            f'export REPO_ROOT="{self.repo}"\n'
+            f'export GH_REPO_SLUG="{gh_repo_slug}"\n'
+            'export HOST_WORKFLOW_SPEC=".config/consensus-rnd/product-quality-loop-workflow.json"\n'
+            f'export PQL_PRODUCT_BUG_TARGET_REPO_ALLOWLIST="{product_bug_allowlist}"\n',
+            encoding="utf-8",
+        )
+        self.ctx = LoopContext.load(repo_root=self.repo, env={"CONSENSUS_RND_HOST_ENV": ".config/consensus-rnd/host.env"})
+
+    def write_pql_product_bug_handoff(self, *, fingerprint: str = "fp-product-bug-1", run_name: str = "bug-1", target_repo: str = "aevatarAI/aevatar") -> Path:
+        run_dir = self.repo / ".pql" / "artifacts" / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        body = (
+            "## Summary\n"
+            "Archived team workflow member page shows Published/bind-ready state, but the workflow editor has no linked draft steps and blocks draft run.\n\n"
+            "## Environment\n"
+            "- scopeId: `7af0b3ad-c4c6-411b-bbfa-14fa70c6aa59`\n"
+            "- teamId: `t-a8f867b4964d4c66bc43224de67bcfb4`\n"
+            "- memberId: `m-3f60c48477cc44fea9a829f3db8de76a`\n\n"
+            "## API Evidence\n"
+            "- team lifecycleStage: `archived`\n"
+            "- member lifecycleStage: `bind_ready`\n"
+            "- binding status: `succeeded`\n\n"
+            "## UI Evidence\n"
+            "- UI shows: Published\n"
+            "- UI also shows: No workflow draft is linked to this member yet\n"
+            "- Run panel blocks with: Add at least one step before running this workflow draft\n"
+            f"\n## PQL Evidence Fingerprint\n`{fingerprint}`\n"
+        )
+        handoff = {
+            "schema_version": "1.0",
+            "provider": "consensus-rnd",
+            "source": "product-quality-loop",
+            "handoff_kind": "product-bug-issue",
+            "status": "ready",
+            "project": "aevatar",
+            "target_repo": target_repo,
+            "tracking_repo": "YueZh127/product-quality-loop",
+            "bug_fingerprint": fingerprint,
+            "bug_title": "[PQL][Aevatar][Workflow] Published workflow member cannot run because no draft steps are linked",
+            "severity": "P1",
+            "recommended_action": "open-or-update-product-bug-issue",
+            "dedupe": {
+                "target_repo": target_repo,
+                "bug_fingerprint": fingerprint,
+                "scope_id": "7af0b3ad-c4c6-411b-bbfa-14fa70c6aa59",
+                "team_id": "t-a8f867b4964d4c66bc43224de67bcfb4",
+                "member_id": "m-3f60c48477cc44fea9a829f3db8de76a",
+            },
+            "bug_type": "aevatar.workflow.published-no-draft",
+            "summary": "Archived team workflow member page shows Published/bind-ready state, but the workflow editor has no linked draft steps and blocks draft run.",
+            "expected": "A published/bind-ready workflow member should either have a linked runnable workflow draft, or the UI/API should clearly mark the member as non-runnable and guide recovery.",
+            "actual": [
+                "UI shows: Published",
+                "UI also shows: No workflow draft is linked to this member yet",
+                "Run panel blocks with: Add at least one step before running this workflow draft",
+            ],
+            "ui_evidence_summary": [
+                "UI shows: Published",
+                "UI also shows: No workflow draft is linked to this member yet",
+                "Run panel blocks with: Add at least one step before running this workflow draft",
+            ],
+            "observed_state": {
+                "team_lifecycle_stage": "archived",
+                "member_lifecycle_stage": "bind_ready",
+                "binding_status": "succeeded",
+            },
+            "ui_evidence": {
+                "shows_published": True,
+                "shows_no_workflow_draft_linked": True,
+                "run_panel_blocks_no_steps": True,
+            },
+            "github_issue": {"labels_if_present": ["bug", "pql", "workflow", "needs-triage"]},
+            "issue_body": body,
+        }
+        handoff_path = run_dir / "product-bug-governance-handoff.json"
+        handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+        return handoff_path
+
+    def write_generic_pql_product_bug_handoff(self, *, fingerprint: str = "fp-generic-product-bug", run_name: str = "bug-generic", target_repo: str = "owner/product") -> Path:
+        run_dir = self.repo / ".pql" / "artifacts" / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        body = (
+            "## Summary\n"
+            "Inventory detail readback returns a stale product state.\n\n"
+            "## Expected\n"
+            "Inventory and detail readback should agree.\n\n"
+            "## Actual\n"
+            "- Detail readback returns 404 after inventory shows the row.\n"
+            f"\n## PQL Evidence Fingerprint\n`{fingerprint}`\n"
+        )
+        handoff = {
+            "schema_version": "1.0",
+            "provider": "consensus-rnd",
+            "source": "product-quality-loop",
+            "handoff_kind": "product-bug-issue",
+            "status": "ready",
+            "project": "sample",
+            "bug_type": "sample.generic-readback-mismatch",
+            "target_repo": target_repo,
+            "tracking_repo": "YueZh127/product-quality-loop",
+            "bug_fingerprint": fingerprint,
+            "bug_title": "[PQL][sample] Generic product bug",
+            "severity": "P2",
+            "recommended_action": "open-or-update-product-bug-issue",
+            "summary": "Inventory detail readback returns a stale product state.",
+            "expected": "Inventory and detail readback should agree.",
+            "actual": ["Detail readback returns 404 after inventory shows the row."],
+            "ui_evidence_summary": [],
+            "observed_state": {"detail_status": "404"},
+            "github_issue": {"labels_if_present": ["bug", "pql"]},
+            "issue_body": body,
+        }
+        handoff_path = run_dir / "product-bug-governance-handoff.json"
+        handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+        return handoff_path
+
+    def write_pql_test_asset_handoff(
+        self,
+        *,
+        handoff_id: str = "pql-test-design:aevatar:1",
+        fingerprint: str = "fp-1",
+        evidence_hash: str = "eh-1",
+        run_name: str = "run-1",
+    ) -> Path:
+        run_dir = self.repo / ".pql" / "artifacts" / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        handoff = {
+            "handoff_id": handoff_id,
+            "fingerprint": fingerprint,
+            "status": "ready",
+            "project": "aevatar",
+            "source_sha": "source-sha",
+            "pql_base_sha": "pql-sha",
+            "evidence_hash": evidence_hash,
+            "allowed_paths": ["project-packs/aevatar/test-cases/**/*.json"],
+        }
+        handoff_path = run_dir / "test-design-handoff.json"
+        handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+        (run_dir / "test-asset-design-gate.json").write_text(
+            json.dumps({"handoff_id": handoff_id, "fingerprint": fingerprint, "evidence_hash": evidence_hash, "verdict": "PASS", "status": "design-gate-passed"}),
+            encoding="utf-8",
+        )
+        (run_dir / "test-asset-design-claim.json").write_text(
+            json.dumps(
+                {
+                    "contract": "pql-test-asset-design-claim",
+                    "handoff_id": handoff_id,
+                    "fingerprint": fingerprint,
+                    "evidence_hash": evidence_hash,
+                    "status": "claimable",
+                    "claim_required": True,
+                    "dedupe_keys": {
+                        "handoff_id": handoff_id,
+                        "fingerprint": fingerprint,
+                        "source_sha": "source-sha",
+                        "pql_base_sha": "pql-sha",
+                        "evidence_hash": evidence_hash,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "test-asset-design-diff-gate.json").write_text(
+            json.dumps(
+                {
+                    "contract": "pql-test-asset-design-diff-gate",
+                    "handoff_id": handoff_id,
+                    "fingerprint": fingerprint,
+                    "evidence_hash": evidence_hash,
+                    "required_marker": f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}",
+                    "marker_is_proof": False,
+                    "required_checks": [
+                        "worker_clean_exit",
+                        "marker_present",
+                        "worktree_diff_non_empty",
+                        "diff_only_touches_allowed_paths",
+                        "diff_does_not_touch_forbidden_paths",
+                        "new_or_modified_cases_remain_design_only",
+                        "handoff_id_matches_worker_output",
+                        "evidence_hash_matches_worker_output",
+                        "validation_commands_pass",
+                        "no_local_absolute_paths_or_secrets_in_outbound_markdown",
+                    ],
+                    "allowed_paths": [
+                        "project-packs/aevatar/product-map.yml",
+                        "project-packs/aevatar/test-selection.yml",
+                        "project-packs/aevatar/test-cases/**/*.json",
+                        "project-packs/aevatar/test-cases/**/*.yml",
+                        "project-packs/aevatar/test-cases/**/*.yaml",
+                        "project-packs/aevatar/test-cases/**/README.md",
+                        "skills/product-quality-loop/tests/**",
+                        "README.md",
+                        "README.zh-CN.md",
+                        "skills/product-quality-loop/references/**",
+                    ],
+                    "forbidden_paths": [
+                        "aevatarAI/aevatar/**",
+                        "src/**",
+                        "apps/**",
+                        ".pql/auth/**",
+                        ".pql/state/**",
+                        ".pql/artifacts/**",
+                        ".pql/generated-cases/**",
+                        "project-packs/*/test-cases/**/*.py",
+                        "**/*token*",
+                        "**/*secret*",
+                    ],
+                    "validation_commands": [
+                        ".venv/bin/python -m pytest skills/product-quality-loop/tests -q",
+                        "npm run validate",
+                        "python3 skills/product-quality-loop/scripts/check_docs.py",
+                        "git diff --check",
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "test-asset-design-worker-prompt.md").write_text(
+            f"write tests\nPQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}\n",
+            encoding="utf-8",
+        )
+        return handoff_path
 
     def release_dispatch_action(self, **overrides) -> dict:
         action = {
@@ -3376,6 +3654,776 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                 self.assertIn(f"WAKEUP_RUNNER_BLOCKED:forbidden:{field}:forbidden_fields:{field}", pending)
                 self.assert_blocked_ledger(f"forbidden:{field}", f"forbidden_fields:{field}")
 
+
+    def test_runner_rejects_pql_test_asset_action_outside_product_quality_loop_repo(self) -> None:
+        (self.repo / "skills/product-quality-loop/scripts").mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo", "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json"},
+        )
+
+        results = self.run_result(self.base_plan(self.pql_test_asset_action()))
+
+        self.assertEqual(results[0].status, "blocked")
+        self.assertEqual(results[0].reason, "pql_test_asset_design_wrong_repo_root")
+
+    def test_runner_rejects_pql_test_asset_action_wrong_workflow_spec(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(repo_root=self.repo, env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo", "HOST_WORKFLOW_SPEC": "workflow.json"})
+
+        results = self.run_result(self.base_plan(self.pql_test_asset_action()))
+
+        self.assertEqual(results[0].status, "blocked")
+        self.assertEqual(results[0].reason, "pql_test_asset_design_wrong_host_workflow_spec")
+
+    def test_runner_rejects_pql_product_bug_issue_action_outside_product_quality_loop_repo(self) -> None:
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo", "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json"},
+        )
+
+        results = self.run_result(self.base_plan(self.pql_product_bug_action()))
+
+        self.assertEqual(results[0].status, "blocked")
+        self.assertEqual(results[0].reason, "pql_product_bug_issue_wrong_repo_root")
+
+    def test_runner_creates_pql_product_bug_issue_and_writes_readback_artifact(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="aevatarAI/aevatar")
+        fingerprint = "fp-product-bug-create"
+        self.write_pql_product_bug_handoff(fingerprint=fingerprint)
+        calls = []
+
+        def command_runner(command):
+            calls.append(command)
+            if command[:3] == ["gh", "issue", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "label", "list"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps([{"name": "bug"}, {"name": "workflow"}]), "")
+            if command[:3] == ["gh", "issue", "create"]:
+                return subprocess.CompletedProcess(command, 0, "https://github.com/aevatarAI/aevatar/issues/77\n", "")
+            if command[:3] == ["gh", "issue", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"number": 77, "title": "created", "url": "https://github.com/aevatarAI/aevatar/issues/77", "body": fingerprint, "state": "OPEN"}), "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        self.assertTrue(any(call[:3] == ["gh", "issue", "create"] for call in calls))
+        create_call = next(call for call in calls if call[:3] == ["gh", "issue", "create"])
+        self.assertIn("--repo", create_call)
+        self.assertIn("aevatarAI/aevatar", create_call)
+        artifact = next((self.repo / ".refactor-loop" / "runs").glob("pql-product-bug-issue-*.json"))
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "issue-created")
+        self.assertEqual(payload["issue_number"], 77)
+        self.assertEqual(payload["readback_status"], "ok")
+
+    def test_runner_creates_generic_pql_product_bug_issue_from_allowed_repo(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="owner/product")
+        fingerprint = "fp-generic-product-bug-create"
+        self.write_generic_pql_product_bug_handoff(fingerprint=fingerprint, target_repo="owner/product")
+        calls = []
+
+        def command_runner(command):
+            calls.append(command)
+            if command[:3] == ["gh", "issue", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "label", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "issue", "create"]:
+                return subprocess.CompletedProcess(command, 0, "https://github.com/owner/product/issues/42\n", "")
+            if command[:3] == ["gh", "issue", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"number": 42, "title": "created", "url": "https://github.com/owner/product/issues/42", "body": fingerprint, "state": "OPEN"}), "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        create_call = next(call for call in calls if call[:3] == ["gh", "issue", "create"])
+        self.assertIn("owner/product", create_call)
+        self.assertTrue(all("No workflow draft is linked" not in " ".join(call) for call in calls))
+        artifact = next((self.repo / ".refactor-loop" / "runs").glob("pql-product-bug-issue-*.json"))
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["target_repo"], "owner/product")
+        self.assertEqual(payload["status"], "issue-created")
+        self.assertEqual(payload["issue_number"], 42)
+
+    def test_runner_blocks_pql_product_bug_issue_for_repo_outside_allowlist(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="owner/product")
+        fingerprint = "fp-wrong-product-bug-target"
+        self.write_generic_pql_product_bug_handoff(fingerprint=fingerprint, target_repo="other/product")
+        calls = []
+
+        def command_runner(command):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        self.assertFalse(calls)
+        artifact = next((self.repo / ".refactor-loop" / "runs").glob("pql-product-bug-issue-*.json"))
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "pql_product_bug_wrong_target_repo")
+
+    def test_runner_comments_existing_pql_product_bug_issue_by_fingerprint(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="aevatarAI/aevatar")
+        fingerprint = "fp-product-bug-existing"
+        self.write_pql_product_bug_handoff(fingerprint=fingerprint)
+        calls = []
+
+        def command_runner(command):
+            calls.append(command)
+            if command[:3] == ["gh", "issue", "list"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps([{"number": 88, "title": "existing", "url": "https://github.com/aevatarAI/aevatar/issues/88", "body": fingerprint}]), "")
+            if command[:3] == ["gh", "issue", "comment"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:3] == ["gh", "issue", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"number": 88, "title": "existing", "url": "https://github.com/aevatarAI/aevatar/issues/88", "body": fingerprint, "state": "OPEN"}), "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        self.assertFalse(any(call[:3] == ["gh", "issue", "create"] for call in calls))
+        self.assertTrue(any(call[:3] == ["gh", "issue", "comment"] for call in calls))
+        artifact = next((self.repo / ".refactor-loop" / "runs").glob("pql-product-bug-issue-*.json"))
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "issue-updated")
+        self.assertEqual(payload["issue_number"], 88)
+
+    def test_runner_uses_open_issue_dedupe_for_pql_product_bug_issue(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="aevatarAI/aevatar")
+        fingerprint = "fp-product-bug-open-dedupe-only"
+        self.write_pql_product_bug_handoff(fingerprint=fingerprint)
+        calls = []
+
+        def command_runner(command):
+            calls.append(command)
+            if command[:3] == ["gh", "issue", "list"]:
+                self.assertIn("open", command)
+                self.assertNotIn("all", command)
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "label", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "issue", "create"]:
+                return subprocess.CompletedProcess(command, 0, "https://github.com/aevatarAI/aevatar/issues/90\n", "")
+            if command[:3] == ["gh", "issue", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"number": 90, "title": "created", "url": "https://github.com/aevatarAI/aevatar/issues/90", "body": fingerprint, "state": "OPEN"}), "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        self.assertTrue(any(call[:3] == ["gh", "issue", "create"] for call in calls))
+        self.assertFalse(any(call[:3] == ["gh", "issue", "comment"] for call in calls))
+        artifact = next((self.repo / ".refactor-loop" / "runs").glob("pql-product-bug-issue-*.json"))
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "issue-created")
+        self.assertEqual(payload["issue_number"], 90)
+
+    def test_runner_keeps_pql_product_bug_handoff_retryable_after_gh_error(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        self.configure_product_quality_loop_context(product_bug_allowlist="aevatarAI/aevatar")
+        fingerprint = "fp-product-bug-error"
+        self.write_pql_product_bug_handoff(fingerprint=fingerprint)
+
+        def command_runner(command):
+            if command[:3] == ["gh", "issue", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "label", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "issue", "create"]:
+                return subprocess.CompletedProcess(command, 1, "", "auth failed")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: self.base_plan(self.pql_product_bug_action()), actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "blocked")
+        claims = json.loads((self.repo / ".refactor-loop/state/pql-product-bug-issue-claims.json").read_text(encoding="utf-8"))
+        self.assertEqual(claims["claims"][fingerprint]["status"], "error")
+        self.assertIsNotNone(runner._find_ready_pql_product_bug_handoff()[0])
+
+    def test_runner_invokes_pql_design_tests_and_dispatches_worker_prompt(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={
+                "REPO_ROOT": str(self.repo),
+                "GH_REPO_SLUG": "owner/repo",
+                "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json",
+                "PQL_PYTHON": sys.executable,
+                "INTEGRATION_BRANCH": "main",
+            },
+        )
+        self.write_pql_test_asset_handoff()
+        actions = FakeActions()
+        actions.repo = self.repo
+        completed = subprocess.CompletedProcess(["pql"], 0, "design ok\n", "")
+
+        with mock.patch("codex_refactor_loop.wakeup_runner.subprocess.run", return_value=completed) as run:
+            with mock.patch("codex_refactor_loop.wakeup_runner.launch_spawn_codex_supervisor", return_value=0) as launch:
+                results = self.run_result(self.base_plan(self.pql_test_asset_action()), actions=actions)
+
+        self.assertEqual(results[0].status, "applied")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], [sys.executable, "skills/product-quality-loop/scripts/run_pql_skill.py", "design-tests", "--project"])
+        self.assertIn("--dry-run", argv)
+        self.assertEqual(Path(launch.call_args.kwargs["repo_root"]).resolve(), self.repo.resolve())
+        prompt_text = Path(launch.call_args.kwargs["prompt"]).read_text(encoding="utf-8")
+        self.assertIn("PQL_TEST_ASSET_DESIGN_DONE:pql-test-design:aevatar:1:eh-1", prompt_text)
+        claims = json.loads((self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json").read_text(encoding="utf-8"))
+        claim = claims["claims"]["pql-test-design:aevatar:1"]
+        self.assertEqual(claim["status"], "worker-dispatched")
+        self.assertNotIn("diff_gate", claim)
+        pending = (self.repo / ".refactor-loop/.controller-pending-events.log").read_text(encoding="utf-8")
+        self.assertIn("PQL_TEST_ASSET_DESIGN_WORKER_DISPATCHED:pql-test-design:aevatar:1", pending)
+
+    def test_runner_resumes_pql_worker_and_passes_diff_gate_after_marker_and_diff(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={
+                "REPO_ROOT": str(self.repo),
+                "GH_REPO_SLUG": "owner/repo",
+                "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json",
+                "PQL_PYTHON": sys.executable,
+            },
+        )
+        handoff_id = "pql-test-design:aevatar:1"
+        evidence_hash = "eh-1"
+        handoff_path = self.write_pql_test_asset_handoff(handoff_id=handoff_id, evidence_hash=evidence_hash)
+        worktree = self.repo / ".worktrees" / "iter0-pql-test-design-aevatar"
+        changed_path = "project-packs/aevatar/test-cases/api/openapi/aevatar-channel-composition-design-cases.json"
+        changed_file = worktree / changed_path
+        changed_file.parent.mkdir(parents=True, exist_ok=True)
+        changed_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "cases": [
+                        {
+                            "case_id": "PQL-DESIGN-001",
+                            "automation_status": "design_only",
+                            "capability_or_user_journey": "channel composition dispatch surfaces",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cluster_id = "pql-test-design-aevatar-1"
+        runner_probe = WakeupRunner(self.ctx)
+        cluster_id = runner_probe._safe_pql_design_cluster_id(handoff_id)
+        log_path = self.repo / ".refactor-loop/logs" / f"pql-test-asset-design-worker-{cluster_id}.log"
+        log_path.write_text(
+            f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}\nEXIT=0\n",
+            encoding="utf-8",
+        )
+        claims = {
+            "claims": {
+                handoff_id: {
+                    "handoff_path": str(handoff_path.relative_to(self.repo)),
+                    "worktree": str(worktree),
+                    "branch": "refactor/iter0-pql-test-design-aevatar",
+                    "status": "worker-dispatched",
+                    "evidence_hash": evidence_hash,
+                    "fingerprint": "fp-1",
+                    "prompt": ".refactor-loop/prompts/pql-test-asset-design.md",
+                }
+            }
+        }
+        claims_path = self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json"
+        claims_path.write_text(json.dumps(claims), encoding="utf-8")
+
+        def command_runner(command):
+            if command[:4] == ["git", "-C", str(worktree), "status"]:
+                return subprocess.CompletedProcess(command, 0, f"?? {changed_path}\0", "")
+            if command[:4] == ["git", "-C", str(worktree), "diff"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command and command[0] == "__cwd__":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        plan = self.base_plan(self.pql_test_asset_action())
+        runner = WakeupRunner(
+            self.ctx,
+            plan_loader=lambda _repo: plan,
+            actions=FakeActions(),
+            supervisor=self.supervisor,
+            command_runner=command_runner,
+        )
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        updated = json.loads(claims_path.read_text(encoding="utf-8"))
+        claim = updated["claims"][handoff_id]
+        self.assertEqual(claim["status"], "diff-gate-passed")
+        self.assertEqual(claim["diff_gate"]["changed_paths"], [changed_path])
+        pending = (self.repo / ".refactor-loop/.controller-pending-events.log").read_text(encoding="utf-8")
+        self.assertIn("PQL_TEST_ASSET_DESIGN_DIFF_GATE_PASSED:pql-test-design:aevatar:1", pending)
+
+    def test_runner_retries_blocked_pql_diff_gate_after_gate_fix(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={
+                "REPO_ROOT": str(self.repo),
+                "GH_REPO_SLUG": "owner/repo",
+                "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json",
+                "PQL_PYTHON": sys.executable,
+            },
+        )
+        handoff_id = "pql-test-design:aevatar:retry"
+        evidence_hash = "eh-retry"
+        handoff_path = self.write_pql_test_asset_handoff(handoff_id=handoff_id, evidence_hash=evidence_hash)
+        worktree = self.repo / ".worktrees" / "retry"
+        changed_path = "project-packs/aevatar/test-cases/api/openapi/retry.json"
+        (worktree / changed_path).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / changed_path).write_text('{"automation_status":"design_only"}\n', encoding="utf-8")
+        cluster_id = WakeupRunner(self.ctx)._safe_pql_design_cluster_id(handoff_id)
+        (self.repo / ".refactor-loop/logs" / f"pql-test-asset-design-worker-{cluster_id}.log").write_text(
+            f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}\nEXIT=0\n",
+            encoding="utf-8",
+        )
+        claims_path = self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json"
+        claims_path.write_text(
+            json.dumps(
+                {
+                    "claims": {
+                        handoff_id: {
+                            "handoff_path": str(handoff_path.relative_to(self.repo)),
+                            "worktree": str(worktree),
+                            "branch": "refactor/retry",
+                            "status": "diff-gate-blocked",
+                            "evidence_hash": evidence_hash,
+                            "fingerprint": "fp-retry",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def command_runner(command):
+            if command[:4] == ["git", "-C", str(worktree), "status"]:
+                return subprocess.CompletedProcess(command, 0, f"?? {changed_path}\0", "")
+            if command[:4] == ["git", "-C", str(worktree), "diff"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command and command[0] == "__cwd__":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(
+            self.ctx,
+            plan_loader=lambda _repo: self.base_plan(self.pql_test_asset_action()),
+            actions=FakeActions(),
+            supervisor=self.supervisor,
+            command_runner=command_runner,
+        )
+        results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        updated = json.loads(claims_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["claims"][handoff_id]["status"], "diff-gate-passed")
+
+    def test_runner_records_unfinished_pql_worker_and_continues_new_handoff_dispatch(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={
+                "REPO_ROOT": str(self.repo),
+                "GH_REPO_SLUG": "owner/repo",
+                "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json",
+                "PQL_PYTHON": sys.executable,
+            },
+        )
+        existing_handoff_id = "pql-test-design:aevatar:existing"
+        existing_hash = "eh-existing"
+        new_handoff_id = "pql-test-design:aevatar:new"
+        self.write_pql_test_asset_handoff(handoff_id=existing_handoff_id, fingerprint="fp-existing", evidence_hash=existing_hash)
+        self.write_pql_test_asset_handoff(handoff_id=new_handoff_id, fingerprint="fp-new", evidence_hash="eh-new", run_name="run-2")
+        worktree = self.repo / ".worktrees" / "iter0-pql-existing"
+        worktree.mkdir(parents=True)
+        cluster_id = WakeupRunner(self.ctx)._safe_pql_design_cluster_id(existing_handoff_id)
+        log_path = self.repo / ".refactor-loop/logs" / f"pql-test-asset-design-worker-{cluster_id}.log"
+        log_path.write_text("worker still running\n", encoding="utf-8")
+        claims_path = self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json"
+        claims_path.write_text(
+            json.dumps(
+                {
+                    "claims": {
+                        existing_handoff_id: {
+                            "handoff_path": ".pql/artifacts/run-1/test-design-handoff.json",
+                            "worktree": str(worktree),
+                            "branch": "refactor/iter0-pql-existing",
+                            "status": "worker-dispatched",
+                            "evidence_hash": existing_hash,
+                            "fingerprint": "fp-existing",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self.base_plan(self.pql_test_asset_action())
+        completed = subprocess.CompletedProcess(["pql"], 0, "design ok\n", "")
+        actions = FakeActions()
+        actions.repo = self.repo
+        with mock.patch("codex_refactor_loop.wakeup_runner.subprocess.run", return_value=completed):
+            with mock.patch("codex_refactor_loop.wakeup_runner.launch_spawn_codex_supervisor", return_value=0):
+                runner = WakeupRunner(
+                    self.ctx,
+                    plan_loader=lambda _repo: plan,
+                    actions=actions,
+                    supervisor=self.supervisor,
+                    command_runner=lambda command: subprocess.CompletedProcess(command, 0, "", ""),
+                )
+                results = runner.run_once()
+
+        self.assertEqual(results[0].status, "applied")
+        updated = json.loads(claims_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["claims"][existing_handoff_id]["status"], "worker-dispatched")
+        self.assertEqual(updated["claims"][new_handoff_id]["status"], "worker-dispatched")
+        pending = (self.repo / ".refactor-loop/.controller-pending-events.log").read_text(encoding="utf-8")
+        self.assertIn("PQL_TEST_ASSET_DESIGN_WORKER_PENDING:pql-test-design:aevatar:existing", pending)
+        self.assertIn("PQL_TEST_ASSET_DESIGN_WORKER_DISPATCHED:pql-test-design:aevatar:new", pending)
+
+    def test_pql_worker_marker_ignores_marker_in_initial_prompt(self) -> None:
+        marker = "PQL_TEST_ASSET_DESIGN_DONE:pql-test-design:aevatar:1:eh-1"
+        log_path = self.repo / ".refactor-loop/logs/pql-marker.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "user",
+                    "When complete emit:",
+                    marker,
+                    "codex",
+                    "implemented changes",
+                    marker,
+                    marker,
+                    "EXIT=0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        runner = WakeupRunner(self.ctx)
+
+        self.assertEqual(runner._pql_worker_marker_error(log_path, marker), "")
+
+    def test_pql_design_only_gate_accepts_explicit_design_only_status_fields(self) -> None:
+        runner = WakeupRunner(self.ctx)
+
+        self.assertEqual(
+            runner._pql_design_only_error(
+                ["project-packs/aevatar/test-selection.yml"],
+                "+      automation_status: design_only\n"
+                "+      implementation_status: design_only\n"
+                "+      runtime_status: not_executed_design_only\n",
+            ),
+            "",
+        )
+        self.assertEqual(
+            runner._pql_design_only_error(
+                ["project-packs/aevatar/test-selection.yml"],
+                "+      automation_status: runtime\n",
+            ),
+            "runtime_enabled_case_change",
+        )
+        self.assertEqual(
+            runner._pql_design_only_error(
+                ["skills/product-quality-loop/tests/test_case.py"],
+                "+    assert manifest['runtime_policy']['default_behavior'] == 'design_only'\n",
+            ),
+            "",
+        )
+
+    def test_pql_leak_scan_ignores_negative_assertions_but_not_literal_leaks(self) -> None:
+        runner = WakeupRunner(self.ctx)
+
+        scan_text = runner._pql_leak_scan_text(
+            '+    assert "/Users/" not in manifest_text\n'
+            '+    assert ".pql/auth" not in manifest_text\n'
+            '+    "path": "/Users/example/leak"\n'
+        )
+
+        self.assertNotIn('assert "/Users/" not in manifest_text', scan_text)
+        self.assertNotIn('old /Users/path', runner._pql_leak_scan_text('- old /Users/path\n'))
+        self.assertIn('"/Users/example/leak"', scan_text)
+
+    def test_pql_diff_gate_ignores_validation_venv_symlink(self) -> None:
+        worktree = self.repo / "worktree"
+        worktree.mkdir()
+        (worktree / ".venv").symlink_to(self.repo / ".venv", target_is_directory=True)
+        runner = WakeupRunner(self.ctx)
+
+        self.assertEqual(
+            runner._pql_filter_validation_support_paths(worktree, [".venv", "project-packs/aevatar/test-selection.yml"]),
+            ["project-packs/aevatar/test-selection.yml"],
+        )
+
+    def test_pql_diff_gate_reads_full_text_only_for_untracked_files(self) -> None:
+        worktree = self.repo / "worktree"
+        tracked = worktree / "project-packs/aevatar/test-selection.yml"
+        untracked = worktree / "project-packs/aevatar/test-cases/api/openapi/new.json"
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        untracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text("PQL_AEVATAR_UI_INTERACTION_MODE=runtime\n", encoding="utf-8")
+        untracked.write_text('{"automation_status":"design_only"}\n', encoding="utf-8")
+        runner = WakeupRunner(self.ctx)
+
+        text = runner._read_untracked_changed_text(
+            worktree,
+            [
+                "project-packs/aevatar/test-selection.yml",
+                "project-packs/aevatar/test-cases/api/openapi/new.json",
+            ],
+            " M project-packs/aevatar/test-selection.yml\0?? project-packs/aevatar/test-cases/api/openapi/new.json\0",
+        )
+
+        self.assertIn('"automation_status":"design_only"', text)
+        self.assertNotIn("PQL_AEVATAR_UI_INTERACTION_MODE=runtime", text)
+
+    def test_runner_prioritizes_claim_with_worker_marker_over_newer_pending_log(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={
+                "REPO_ROOT": str(self.repo),
+                "GH_REPO_SLUG": "owner/repo",
+                "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json",
+                "PQL_PYTHON": sys.executable,
+            },
+        )
+        ready_id = "pql-test-design:aevatar:ready"
+        ready_hash = "eh-ready"
+        pending_id = "pql-test-design:aevatar:pending"
+        pending_hash = "eh-pending"
+        ready_handoff = self.write_pql_test_asset_handoff(handoff_id=ready_id, fingerprint="fp-ready", evidence_hash=ready_hash)
+        pending_dir = self.repo / ".pql" / "artifacts" / "run-2"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_handoff = pending_dir / "test-design-handoff.json"
+        pending_handoff.write_text(
+            json.dumps(
+                {
+                    "handoff_id": pending_id,
+                    "fingerprint": "fp-pending",
+                    "status": "ready",
+                    "project": "aevatar",
+                    "source_sha": "source-sha-pending",
+                    "pql_base_sha": "pql-sha",
+                    "evidence_hash": pending_hash,
+                    "allowed_paths": ["project-packs/aevatar/test-cases/**/*.json"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        ready_worktree = self.repo / ".worktrees" / "ready"
+        pending_worktree = self.repo / ".worktrees" / "pending"
+        changed_path = "project-packs/aevatar/test-cases/api/openapi/ready.json"
+        (ready_worktree / changed_path).parent.mkdir(parents=True, exist_ok=True)
+        (ready_worktree / changed_path).write_text('{"automation_status":"design_only"}\n', encoding="utf-8")
+        pending_worktree.mkdir(parents=True)
+        ready_cluster = WakeupRunner(self.ctx)._safe_pql_design_cluster_id(ready_id)
+        pending_cluster = WakeupRunner(self.ctx)._safe_pql_design_cluster_id(pending_id)
+        (self.repo / ".refactor-loop/logs" / f"pql-test-asset-design-worker-{ready_cluster}.log").write_text(
+            f"codex\nPQL_TEST_ASSET_DESIGN_DONE:{ready_id}:{ready_hash}\nEXIT=0\n",
+            encoding="utf-8",
+        )
+        (self.repo / ".refactor-loop/logs" / f"pql-test-asset-design-worker-{pending_cluster}.log").write_text(
+            "codex\nstill running\n",
+            encoding="utf-8",
+        )
+        claims_path = self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json"
+        claims_path.write_text(
+            json.dumps(
+                {
+                    "claims": {
+                        pending_id: {
+                            "handoff_path": str(pending_handoff.relative_to(self.repo)),
+                            "worktree": str(pending_worktree),
+                            "branch": "refactor/pending",
+                            "status": "worker-dispatched",
+                            "evidence_hash": pending_hash,
+                            "fingerprint": "fp-pending",
+                        },
+                        ready_id: {
+                            "handoff_path": str(ready_handoff.relative_to(self.repo)),
+                            "worktree": str(ready_worktree),
+                            "branch": "refactor/ready",
+                            "status": "worker-dispatched",
+                            "evidence_hash": ready_hash,
+                            "fingerprint": "fp-ready",
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def command_runner(command):
+            if command[:4] == ["git", "-C", str(ready_worktree), "status"]:
+                return subprocess.CompletedProcess(command, 0, f"?? {changed_path}\0", "")
+            if command[:4] == ["git", "-C", str(ready_worktree), "diff"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command and command[0] == "__cwd__":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        plan = self.base_plan(self.pql_test_asset_action())
+        runner = WakeupRunner(self.ctx, plan_loader=lambda _repo: plan, actions=FakeActions(), supervisor=self.supervisor, command_runner=command_runner)
+        runner.run_once()
+
+        updated = json.loads(claims_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["claims"][ready_id]["status"], "diff-gate-passed")
+        self.assertEqual(updated["claims"][pending_id]["status"], "worker-dispatched")
+
+    def test_pql_diff_gate_links_repo_venv_for_worktree_validation(self) -> None:
+        (self.repo / ".venv").mkdir()
+        worktree = self.repo / ".worktrees" / "pql"
+        worktree.mkdir(parents=True)
+        runner = WakeupRunner(self.ctx)
+
+        runner._ensure_pql_validation_venv_link(worktree)
+
+        self.assertTrue((worktree / ".venv").is_symlink())
+        self.assertEqual((worktree / ".venv").resolve(), (self.repo / ".venv").resolve())
+
+    def test_pql_validation_python_preserves_venv_entrypoint(self) -> None:
+        ctx = LoopContext.load(repo_root=self.repo, env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo", "PQL_PYTHON": ".venv/bin/python"})
+        runner = WakeupRunner(ctx)
+
+        python = runner._fixed_pql_validation_commands()[0][1][0]
+        self.assertTrue(python.endswith("/.venv/bin/python"))
+        self.assertNotEqual(python, sys.executable)
+
+    def test_pql_worker_base_snapshot_commits_current_dirty_root(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        (self.repo / ".refactor-loop/state").mkdir(parents=True)
+        (self.repo / "skills/product-quality-loop/tests").mkdir(parents=True)
+        (self.repo / "skills/product-quality-loop/tests/current_test.py").write_text("assert True\n", encoding="utf-8")
+        worktree = self.repo / ".worktrees" / "pql"
+        worktree.mkdir(parents=True)
+        ctx = LoopContext.load(repo_root=self.repo, env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo"})
+        repo_root = ctx.repo_root
+        calls: list[list[str]] = []
+
+        def command_runner(command):
+            calls.append(list(command))
+            if command[:4] == ["git", "-C", str(worktree), "log"]:
+                return subprocess.CompletedProcess(command, 0, "main\n", "")
+            if command[:4] == ["git", "-C", str(repo_root), "status"]:
+                return subprocess.CompletedProcess(command, 0, "?? skills/product-quality-loop/tests/current_test.py\0", "")
+            if command[:4] == ["git", "-C", str(repo_root), "diff"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:4] == ["git", "-C", str(repo_root), "ls-files"]:
+                return subprocess.CompletedProcess(command, 0, "skills/product-quality-loop/tests/current_test.py\0.pql/artifacts/run.json\0.DS_Store\0", "")
+            if command[:4] == ["git", "-C", str(worktree), "diff"] and "--cached" in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = WakeupRunner(ctx, command_runner=command_runner)
+
+        runner._prepare_pql_current_base_snapshot(worktree)
+
+        self.assertTrue((worktree / "skills/product-quality-loop/tests/current_test.py").is_file())
+        self.assertFalse((worktree / ".pql/artifacts/run.json").exists())
+        self.assertFalse((worktree / ".DS_Store").exists())
+        self.assertFalse((worktree / ".pql-base-snapshot-applied").exists())
+        self.assertTrue(any(command[-3:] == ["commit", "-m", "PQL base snapshot for test asset design"] for command in calls))
+
+    def test_runner_blocks_pql_diff_gate_marker_as_proof_contract(self) -> None:
+        product_repo = self.repo / "product-quality-loop"
+        product_repo.mkdir()
+        self.repo = product_repo
+        for rel in (".refactor-loop/state", ".refactor-loop/logs", ".refactor-loop/prompts", ".refactor-loop/runs", "skills/product-quality-loop/scripts"):
+            (self.repo / rel).mkdir(parents=True, exist_ok=True)
+        (self.repo / "skills/product-quality-loop/scripts/run_pql_skill.py").write_text("", encoding="utf-8")
+        self.ctx = LoopContext.load(
+            repo_root=self.repo,
+            env={"REPO_ROOT": str(self.repo), "GH_REPO_SLUG": "owner/repo", "HOST_WORKFLOW_SPEC": ".config/consensus-rnd/product-quality-loop-workflow.json", "PQL_PYTHON": sys.executable},
+        )
+        handoff_path = self.write_pql_test_asset_handoff()
+        diff_gate = json.loads((handoff_path.parent / "test-asset-design-diff-gate.json").read_text(encoding="utf-8"))
+        diff_gate["marker_is_proof"] = True
+        (handoff_path.parent / "test-asset-design-diff-gate.json").write_text(json.dumps(diff_gate), encoding="utf-8")
+        actions = FakeActions()
+        actions.repo = self.repo
+        completed = subprocess.CompletedProcess(["pql"], 0, "design ok\n", "")
+
+        with mock.patch("codex_refactor_loop.wakeup_runner.subprocess.run", return_value=completed):
+            results = self.run_result(self.base_plan(self.pql_test_asset_action()), actions=actions)
+
+        self.assertEqual(results[0].status, "applied")
+        claims = json.loads((self.repo / ".refactor-loop/state/pql-test-asset-design-claims.json").read_text(encoding="utf-8"))
+        self.assertEqual(claims["claims"]["pql-test-design:aevatar:1"]["status"], "design-gate-blocked")
+        pending = (self.repo / ".refactor-loop/.controller-pending-events.log").read_text(encoding="utf-8")
+        self.assertIn("PQL_TEST_ASSET_DESIGN_GATE_BLOCKED:pql-test-design:aevatar:1:pql_diff_gate_marker_is_proof", pending)
+
     def test_effect_admission_boundary_is_concrete_controller_action_allowlist_only(self) -> None:
         expected_actions = {
             "spawn_codex_harness_background",
@@ -3397,6 +4445,8 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             "publish_release_candidate",
             "apply_issue_decomposition_plan",
             "apply_default_issue_intake_claim",
+            "run_host_product_quality_loop_test_asset_design",
+            "run_host_product_quality_loop_product_bug_issue",
         }
 
         self.assertEqual(SUPPORTED_CONTROLLER_ACTIONS, expected_actions)

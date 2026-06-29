@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from .active_controller import require_active_controller, write_active_controller_status
@@ -133,13 +137,15 @@ SUPPORTED_CONTROLLER_ACTIONS = {
     "publish_release_candidate",
     "apply_issue_decomposition_plan",
     "apply_default_issue_intake_claim",
+    "run_host_product_quality_loop_test_asset_design",
+    "run_host_product_quality_loop_product_bug_issue",
 }
 # Worker-dispatch (non-lifecycle) controller actions that may batch up to the
 # per-tick spawn budget. Both directly spawn codex workers and carry no
 # lifecycle authority, so batching them only fills the concurrency floor faster
 # and never batches review/merge/close/release lifecycle actions.
 SPAWN_BATCH_CONTROLLER_ACTIONS = frozenset(
-    {"spawn_codex_harness_background"}
+    {"spawn_codex_harness_background", "run_host_product_quality_loop_test_asset_design"}
 )
 SAME_TICK_TERMINAL_PR_WORKER_ACTIONS = frozenset(
     {
@@ -680,6 +686,10 @@ class WakeupRunner:
             return f"unsupported_controller_action:{controller_action or 'missing'}"
         if controller_action == "spawn_codex_harness_background":
             return self._validate_spawn_codex(action)
+        if controller_action == "run_host_product_quality_loop_test_asset_design":
+            return self._validate_host_product_quality_loop_test_asset_design(action)
+        if controller_action == "run_host_product_quality_loop_product_bug_issue":
+            return self._validate_host_product_quality_loop_product_bug_issue(action)
         if controller_action == "safe_push":
             return self._validate_safe_push(action)
         if controller_action == "review_gate":
@@ -714,6 +724,33 @@ class WakeupRunner:
             return self._validate_release_rollup_auto_merge(action)
         if controller_action == "close_managed_item_from_drop_marker":
             return self._validate_close_managed_drop(action)
+        return None
+
+    def _validate_host_product_quality_loop_test_asset_design(self, action: Mapping[str, Any]) -> str | None:
+        if self.ctx.repo_root.name != "product-quality-loop":
+            return "pql_test_asset_design_wrong_repo_root"
+        workflow_spec = str(self.ctx.host_workflow_spec_path or "")
+        if workflow_spec != ".config/consensus-rnd/product-quality-loop-workflow.json":
+            return "pql_test_asset_design_wrong_host_workflow_spec"
+        if action.get("item") != "host:product-quality-loop-test-asset-design":
+            return "pql_test_asset_design_wrong_item"
+        if action.get("target_kind") != "host":
+            return "pql_test_asset_design_wrong_target_kind"
+        script = self.ctx.repo_root / "skills" / "product-quality-loop" / "scripts" / "run_pql_skill.py"
+        if not script.is_file():
+            return "pql_test_asset_design_wrapper_missing"
+        return None
+
+    def _validate_host_product_quality_loop_product_bug_issue(self, action: Mapping[str, Any]) -> str | None:
+        if self.ctx.repo_root.name != "product-quality-loop":
+            return "pql_product_bug_issue_wrong_repo_root"
+        workflow_spec = str(self.ctx.host_workflow_spec_path or "")
+        if workflow_spec != ".config/consensus-rnd/product-quality-loop-workflow.json":
+            return "pql_product_bug_issue_wrong_host_workflow_spec"
+        if action.get("item") != "host:product-quality-loop-product-bug-issue":
+            return "pql_product_bug_issue_wrong_item"
+        if action.get("target_kind") != "host":
+            return "pql_product_bug_issue_wrong_target_kind"
         return None
 
     def _validate_spawn_codex(self, action: Mapping[str, Any]) -> str | None:
@@ -1666,6 +1703,10 @@ class WakeupRunner:
     def _dispatch(self, controller_action: str, action: Mapping[str, Any]) -> int:
         if controller_action == "spawn_codex_harness_background":
             return self._spawn_codex(action)
+        if controller_action == "run_host_product_quality_loop_test_asset_design":
+            return self._run_host_product_quality_loop_test_asset_design(action)
+        if controller_action == "run_host_product_quality_loop_product_bug_issue":
+            return self._run_host_product_quality_loop_product_bug_issue(action)
         if controller_action == "safe_push":
             return self.actions.safe_push(branch=str(action.get("head_ref") or ""), worktree=str(action.get("worktree") or ""))
         if controller_action == "dispatch_consensus_implementation":
@@ -1737,6 +1778,1062 @@ class WakeupRunner:
             return 0
         self._append_pending_event(f"WAKEUP_RUNNER_UNAPPLIED:{controller_action}:{action.get('action_id')}")
         return 0
+
+
+    def _pql_product_bug_claims_path(self) -> Path:
+        return self.ctx.paths.state / "pql-product-bug-issue-claims.json"
+
+    def _read_pql_product_bug_claims(self) -> dict[str, Any]:
+        path = self._pql_product_bug_claims_path()
+        if not path.is_file():
+            return {"claims": {}}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"claims": {}}
+        return payload if isinstance(payload, dict) else {"claims": {}}
+
+    def _write_pql_product_bug_claims(self, payload: Mapping[str, Any]) -> None:
+        path = self._pql_product_bug_claims_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+    def _find_ready_pql_product_bug_handoff(self) -> tuple[Path | None, dict[str, Any] | None]:
+        artifacts = self.ctx.repo_root / ".pql" / "artifacts"
+        if not artifacts.is_dir():
+            return None, None
+        candidates = sorted(artifacts.rglob("product-bug-governance-handoff.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        claims = self._read_pql_product_bug_claims().get("claims")
+        claims = claims if isinstance(claims, dict) else {}
+        terminal_or_active = {"claimed", "issue-created", "issue-updated", "blocked"}
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "ready":
+                continue
+            fingerprint = str(payload.get("bug_fingerprint") or "")
+            if not fingerprint:
+                continue
+            existing = claims.get(fingerprint)
+            if isinstance(existing, dict) and existing.get("status") in terminal_or_active:
+                continue
+            return path, payload
+        return None, None
+
+    def _claim_pql_product_bug_handoff(self, handoff_path: Path, handoff: Mapping[str, Any]) -> str | None:
+        fingerprint = str(handoff.get("bug_fingerprint") or "")
+        if not fingerprint:
+            return "pql_product_bug_missing_fingerprint"
+        lock_path = self._pql_product_bug_claims_path().with_suffix(".json.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return "pql_product_bug_claim_lock_busy"
+        try:
+            os.write(fd, f"pid={os.getpid()}\n".encode("utf-8"))
+            payload = self._read_pql_product_bug_claims()
+            claims = payload.setdefault("claims", {})
+            if not isinstance(claims, dict):
+                payload["claims"] = claims = {}
+            existing = claims.get(fingerprint)
+            if isinstance(existing, dict) and existing.get("status") in {"claimed", "issue-created", "issue-updated", "blocked"}:
+                return "pql_product_bug_duplicate_fingerprint"
+            claims[fingerprint] = {
+                "status": "claimed",
+                "target_repo": str(handoff.get("target_repo") or ""),
+                "handoff_path": self.ctx.durable_artifact_path(handoff_path),
+            }
+            self._write_pql_product_bug_claims(payload)
+            return None
+        finally:
+            os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _update_pql_product_bug_claim(self, fingerprint: str, **updates: Any) -> None:
+        payload = self._read_pql_product_bug_claims()
+        claims = payload.setdefault("claims", {})
+        if not isinstance(claims, dict):
+            payload["claims"] = claims = {}
+        current = claims.setdefault(fingerprint, {})
+        if isinstance(current, dict):
+            current.update(updates)
+        self._write_pql_product_bug_claims(payload)
+
+    def _validate_pql_product_bug_handoff(self, handoff: Mapping[str, Any]) -> str:
+        if handoff.get("handoff_kind") != "product-bug-issue":
+            return "pql_product_bug_wrong_handoff_kind"
+        if handoff.get("status") != "ready":
+            return "pql_product_bug_not_ready"
+        if str(handoff.get("target_repo") or "") not in self._allowed_pql_product_bug_repos():
+            return "pql_product_bug_wrong_target_repo"
+        if not str(handoff.get("bug_fingerprint") or ""):
+            return "pql_product_bug_missing_fingerprint"
+        if not str(handoff.get("bug_title") or ""):
+            return "pql_product_bug_missing_title"
+        if not str(handoff.get("summary") or ""):
+            return "pql_product_bug_missing_summary"
+        if not str(handoff.get("expected") or ""):
+            return "pql_product_bug_missing_expected"
+        actual = handoff.get("actual")
+        ui_summary = handoff.get("ui_evidence_summary")
+        has_actual = isinstance(actual, Sequence) and not isinstance(actual, (str, bytes)) and any(str(item or "").strip() for item in actual)
+        has_ui_summary = isinstance(ui_summary, Sequence) and not isinstance(ui_summary, (str, bytes)) and any(str(item or "").strip() for item in ui_summary)
+        if not has_actual and not has_ui_summary:
+            return "pql_product_bug_missing_observation_summary"
+        body = str(handoff.get("issue_body") or "")
+        if not body:
+            return "pql_product_bug_missing_issue_body"
+        if re.search(r"(/Users/|/home/|/tmp/|/private/var/|/var/folders/|[A-Za-z]:\\\\)", body):
+            return "pql_product_bug_issue_body_local_path_leak"
+        if re.search(r"(?i)(token|secret|authorization|bearer)", body):
+            return "pql_product_bug_issue_body_secret_leak"
+        if str(handoff.get("bug_type") or "") == "aevatar.workflow.published-no-draft":
+            observed = handoff.get("observed_state") if isinstance(handoff.get("observed_state"), Mapping) else {}
+            expected_observed = {
+                "team_lifecycle_stage": "archived",
+                "member_lifecycle_stage": "bind_ready",
+                "binding_status": "succeeded",
+            }
+            for key, expected in expected_observed.items():
+                if str(observed.get(key) or "") != expected:
+                    return f"pql_product_bug_missing_structured_observed:{key}"
+            ui = handoff.get("ui_evidence") if isinstance(handoff.get("ui_evidence"), Mapping) else {}
+            for key in ("shows_published", "shows_no_workflow_draft_linked", "run_panel_blocks_no_steps"):
+                if ui.get(key) is not True:
+                    return f"pql_product_bug_missing_structured_ui:{key}"
+        return ""
+
+    def _allowed_pql_product_bug_repos(self) -> set[str]:
+        env = self.ctx.env_for_subprocess()
+        repos: set[str] = set()
+        for name in ("PQL_PRODUCT_BUG_TARGET_REPO_ALLOWLIST", "PQL_GH_REPO_SLUG", "PQL_TARGET_REPO_SLUG"):
+            raw = str(env.get(name) or "")
+            for item in raw.split(","):
+                slug = item.strip()
+                if slug:
+                    repos.add(slug)
+        return repos
+
+    def _pql_product_bug_issue_artifact_path(self, fingerprint: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", fingerprint)[:48] or "missing"
+        return self.ctx.paths.runs / f"pql-product-bug-issue-{safe}.json"
+
+    def _write_pql_product_bug_issue_artifact(self, fingerprint: str, payload: Mapping[str, Any]) -> None:
+        path = self._pql_product_bug_issue_artifact_path(fingerprint)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    def _existing_pql_product_bug_issue(self, repo: str, fingerprint: str) -> dict[str, Any] | None:
+        completed = self.command_runner(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--search",
+                fingerprint,
+                "--json",
+                "number,title,url,body",
+                "--limit",
+                "10",
+            ]
+        )
+        if completed.returncode != 0:
+            return None
+        try:
+            issues = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(issues, list):
+            return None
+        for issue in issues:
+            if isinstance(issue, dict) and fingerprint in str(issue.get("body") or ""):
+                return issue
+        return None
+
+    def _existing_labels_for_repo(self, repo: str, requested: Sequence[str]) -> list[str]:
+        if not requested:
+            return []
+        completed = self.command_runner(["gh", "label", "list", "--repo", repo, "--json", "name", "--limit", "200"])
+        if completed.returncode != 0:
+            return []
+        try:
+            labels_payload = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        existing = {str(item.get("name") or "") for item in labels_payload if isinstance(item, dict)}
+        return [label for label in requested if label in existing]
+
+    def _readback_issue(self, repo: str, number: int) -> dict[str, Any]:
+        completed = self.command_runner(["gh", "issue", "view", str(number), "--repo", repo, "--json", "number,title,url,body,state"])
+        if completed.returncode != 0:
+            return {"number": number, "readback_status": "failed", "stderr": completed.stderr}
+        try:
+            payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            return {"number": number, "readback_status": "invalid-json"}
+        if not isinstance(payload, dict):
+            return {"number": number, "readback_status": "invalid-payload"}
+        payload["readback_status"] = "ok"
+        return payload
+
+    def _run_host_product_quality_loop_product_bug_issue(self, action: Mapping[str, Any]) -> int:
+        handoff_path, handoff = self._find_ready_pql_product_bug_handoff()
+        if handoff_path is None or handoff is None:
+            self._append_pending_event("PQL_PRODUCT_BUG_ISSUE_NO_READY_HANDOFF")
+            return 4
+        validation_error = self._validate_pql_product_bug_handoff(handoff)
+        fingerprint = str(handoff.get("bug_fingerprint") or "")
+        if validation_error:
+            self._write_pql_product_bug_issue_artifact(
+                fingerprint or "missing",
+                {
+                    "status": "blocked",
+                    "reason": validation_error,
+                    "handoff_path": self.ctx.durable_artifact_path(handoff_path),
+                },
+            )
+            self._append_pending_event(f"PQL_PRODUCT_BUG_ISSUE_BLOCKED:{fingerprint or 'missing'}:{validation_error}")
+            return 0
+        claim_error = self._claim_pql_product_bug_handoff(handoff_path, handoff)
+        if claim_error:
+            self._append_pending_event(f"WAKEUP_RUNNER_BLOCKED:{action.get('action_id', '')}:{claim_error}")
+            return 3
+        repo = str(handoff.get("target_repo") or "")
+        title = str(handoff.get("bug_title") or "")
+        body = str(handoff.get("issue_body") or "")
+        existing = self._existing_pql_product_bug_issue(repo, fingerprint)
+        if existing:
+            number = int(existing.get("number") or 0)
+            comment_body = body + "\n\nPQL duplicate/readback update for existing fingerprint.\n"
+            completed = self.command_runner(["gh", "issue", "comment", str(number), "--repo", repo, "--body", comment_body])
+            operation = "issue-updated"
+        else:
+            labels = self._existing_labels_for_repo(repo, [str(label) for label in (handoff.get("github_issue") or {}).get("labels_if_present", [])])
+            command = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body]
+            for label in labels:
+                command.extend(["--label", label])
+            completed = self.command_runner(command)
+            operation = "issue-created"
+            number = 0
+        if completed.returncode != 0:
+            artifact = {
+                "status": "error",
+                "operation": operation,
+                "target_repo": repo,
+                "bug_fingerprint": fingerprint,
+                "returncode": completed.returncode,
+                "stderr": completed.stderr,
+            }
+            self._write_pql_product_bug_issue_artifact(fingerprint, artifact)
+            self._update_pql_product_bug_claim(fingerprint, status="error", artifact=self.ctx.durable_artifact_path(self._pql_product_bug_issue_artifact_path(fingerprint)))
+            self._append_pending_event(f"PQL_PRODUCT_BUG_ISSUE_ERROR:{fingerprint}:gh_exit_{completed.returncode}")
+            return completed.returncode
+        if not existing:
+            url = (completed.stdout or "").strip().splitlines()[-1] if completed.stdout else ""
+            match = re.search(r"/issues/([1-9][0-9]*)", url)
+            number = int(match.group(1)) if match else 0
+        readback = self._readback_issue(repo, number) if number else {"readback_status": "missing-number"}
+        artifact = {
+            "status": operation,
+            "target_repo": repo,
+            "bug_fingerprint": fingerprint,
+            "issue_number": number,
+            "issue_url": readback.get("url") or (completed.stdout or "").strip(),
+            "issue_title": readback.get("title") or title,
+            "readback_status": readback.get("readback_status"),
+            "handoff_path": self.ctx.durable_artifact_path(handoff_path),
+        }
+        self._write_pql_product_bug_issue_artifact(fingerprint, artifact)
+        self._update_pql_product_bug_claim(
+            fingerprint,
+            status=operation,
+            issue_number=number,
+            issue_url=str(artifact.get("issue_url") or ""),
+            artifact=self.ctx.durable_artifact_path(self._pql_product_bug_issue_artifact_path(fingerprint)),
+        )
+        self._append_pending_event(f"PQL_PRODUCT_BUG_ISSUE_{operation.upper().replace('-', '_')}:{fingerprint}:{number}")
+        return 0
+
+
+    def _pql_test_asset_claims_path(self) -> Path:
+        return self.ctx.paths.state / "pql-test-asset-design-claims.json"
+
+    def _read_pql_test_asset_claims(self) -> dict[str, Any]:
+        path = self._pql_test_asset_claims_path()
+        if not path.is_file():
+            return {"claims": {}}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"claims": {}}
+        return payload if isinstance(payload, dict) else {"claims": {}}
+
+    def _write_pql_test_asset_claims(self, payload: Mapping[str, Any]) -> None:
+        path = self._pql_test_asset_claims_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+    def _find_ready_pql_test_design_handoff(self) -> tuple[Path | None, dict[str, Any] | None]:
+        artifacts = self.ctx.repo_root / ".pql" / "artifacts"
+        if not artifacts.is_dir():
+            return None, None
+        candidates = sorted(artifacts.rglob("test-design-handoff.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        claims = self._read_pql_test_asset_claims().get("claims")
+        claims = claims if isinstance(claims, dict) else {}
+        active_statuses = {
+            "claimed",
+            "worker-dispatched",
+            "design-gate-passed",
+            "design-gate-blocked",
+            "diff-gate-passed",
+            "diff-gate-blocked",
+            "pr-created",
+            "closed",
+        }
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "ready":
+                continue
+            handoff_id = str(payload.get("handoff_id") or "")
+            fingerprint = str(payload.get("fingerprint") or "")
+            if not handoff_id:
+                continue
+            existing = claims.get(handoff_id)
+            if isinstance(existing, dict) and existing.get("status") in active_statuses:
+                continue
+            if fingerprint:
+                duplicate = any(
+                    isinstance(claim, dict)
+                    and claim.get("fingerprint") == fingerprint
+                    and claim.get("status") in active_statuses
+                    for claim in claims.values()
+                )
+                if duplicate:
+                    continue
+            return path, payload
+        return None, None
+
+    def _claim_pql_test_design_handoff(self, handoff_path: Path, handoff: Mapping[str, Any]) -> str | None:
+        handoff_id = str(handoff.get("handoff_id") or "")
+        if not handoff_id:
+            return "pql_test_asset_design_missing_handoff_id"
+        lock_path = self._pql_test_asset_claims_path().with_suffix(".json.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return "pql_test_asset_design_claim_lock_busy"
+        try:
+            os.write(fd, f"pid={os.getpid()}\n".encode("utf-8"))
+            payload = self._read_pql_test_asset_claims()
+            claims = payload.setdefault("claims", {})
+            if not isinstance(claims, dict):
+                payload["claims"] = claims = {}
+            active_statuses = {
+                "claimed",
+                "worker-dispatched",
+                "design-gate-passed",
+                "design-gate-blocked",
+                "diff-gate-passed",
+                "diff-gate-blocked",
+                "pr-created",
+                "closed",
+            }
+            if handoff_id in claims and isinstance(claims[handoff_id], dict) and claims[handoff_id].get("status") in active_statuses:
+                return "pql_test_asset_design_duplicate_claim"
+            fingerprint = str(handoff.get("fingerprint") or "")
+            if fingerprint:
+                for claim_id, claim in claims.items():
+                    if claim_id == handoff_id or not isinstance(claim, dict):
+                        continue
+                    if claim.get("fingerprint") == fingerprint and claim.get("status") in active_statuses:
+                        return "pql_test_asset_design_duplicate_fingerprint"
+            claims[handoff_id] = {
+                "status": "claimed",
+                "fingerprint": fingerprint,
+                "source_sha": str(handoff.get("source_sha") or ""),
+                "pql_base_sha": str(handoff.get("pql_base_sha") or ""),
+                "evidence_hash": str(handoff.get("evidence_hash") or ""),
+                "handoff_path": self.ctx.durable_artifact_path(handoff_path),
+            }
+            self._write_pql_test_asset_claims(payload)
+            return None
+        finally:
+            os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _update_pql_test_asset_claim(self, handoff_id: str, **updates: Any) -> None:
+        payload = self._read_pql_test_asset_claims()
+        claims = payload.setdefault("claims", {})
+        if not isinstance(claims, dict):
+            payload["claims"] = claims = {}
+        current = claims.setdefault(handoff_id, {})
+        if isinstance(current, dict):
+            current.update(updates)
+        self._write_pql_test_asset_claims(payload)
+
+    def _run_host_product_quality_loop_test_asset_design(self, action: Mapping[str, Any]) -> int:
+        resumed = self._resume_pql_test_asset_design_diff_gate(action)
+        if resumed is not None:
+            return resumed
+        handoff_path, handoff = self._find_ready_pql_test_design_handoff()
+        if handoff_path is None or handoff is None:
+            self._append_pending_event("PQL_TEST_ASSET_DESIGN_NO_READY_HANDOFF")
+            return 4
+        claim_error = self._claim_pql_test_design_handoff(handoff_path, handoff)
+        if claim_error:
+            self._append_pending_event(f"WAKEUP_RUNNER_BLOCKED:{action.get('action_id', '')}:{claim_error}")
+            return 3
+        handoff_id = str(handoff.get("handoff_id") or "")
+        env = self.ctx.env_for_subprocess()
+        command = [
+            env.get("PQL_PYTHON") or sys.executable,
+            "skills/product-quality-loop/scripts/run_pql_skill.py",
+            "design-tests",
+            "--project",
+            str(handoff.get("project") or "aevatar"),
+            "--handoff",
+            self.ctx.durable_artifact_path(handoff_path),
+            "--dry-run",
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=str(self.ctx.repo_root),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        log_path = self.ctx.paths.logs / f"host-product-quality-loop-test-asset-design-{self._safe_pql_design_cluster_id(handoff_id)}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(completed.stdout or "", encoding="utf-8")
+        gate_path = handoff_path.parent / "test-asset-design-gate.json"
+        gate = self._pql_test_asset_design_json(handoff_path, "test-asset-design-gate.json")
+        claim_contract = self._pql_test_asset_design_json(handoff_path, "test-asset-design-claim.json")
+        diff_gate_contract = self._pql_test_asset_design_json(handoff_path, "test-asset-design-diff-gate.json")
+        gate_error = (
+            self._validate_pql_test_asset_design_gate(handoff, gate)
+            or self._validate_pql_test_asset_claim_contract(handoff, claim_contract)
+            or self._validate_pql_test_asset_diff_gate_contract(handoff, diff_gate_contract)
+        )
+        if completed.returncode != 0 or gate.get("verdict") != "PASS" or gate_error:
+            blocked_gate = dict(gate) if isinstance(gate, dict) else {}
+            blockers = blocked_gate.setdefault("blockers", [])
+            if gate_error:
+                blockers.append({"code": gate_error, "message": "design gate identity mismatch"})
+            if completed.returncode != 0:
+                blockers.append({"code": f"pql_design_tests_exit_{completed.returncode}", "message": "PQL design-tests failed"})
+            self._update_pql_test_asset_claim(handoff_id, status="design-gate-blocked", gate=blocked_gate)
+            self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_GATE_BLOCKED:{handoff_id}:{gate_error or 'verdict'}")
+            return 0
+        base_ref = self.actions.integration_branch or "HEAD"
+        worktree, branch = self.actions.safe_worktree("0", self._safe_pql_design_cluster_id(handoff_id), base_ref)
+        self._prepare_pql_current_base_snapshot(worktree)
+        prompt_path = self._write_pql_test_asset_design_worker_prompt(handoff_path, handoff, gate, worktree=worktree)
+        self._update_pql_test_asset_claim(
+            handoff_id,
+            status="design-gate-passed",
+            prompt=self.ctx.durable_artifact_path(prompt_path),
+            worktree=str(worktree),
+            branch=branch,
+        )
+        spawn_action = {
+            "kind": "harness-spawn-intent",
+            "action_id": f"pql-test-asset-design-worker:{self._safe_pql_design_cluster_id(handoff_id)}",
+            "runner_authority": RUNNER_AUTHORITY,
+            "preconditions": ["active_controller_owner", "pql_design_gate_passed", "target_log_absent"],
+            "source_artifact": self.ctx.durable_artifact_path(gate_path),
+            "source_marker": "design-gate-passed",
+            "target_kind": "codex",
+            "target_number": None,
+            "target": {"kind": "codex", "task_id": f"pql-test-asset-design-{handoff_id[:32]}"},
+            "controller_action": "spawn_codex_harness_background",
+            "no_generic_command": True,
+            "cd": str(worktree),
+            "prompt": str(prompt_path),
+            "log": str(self.ctx.paths.logs / f"pql-test-asset-design-worker-{self._safe_pql_design_cluster_id(handoff_id)}.log"),
+            "stall": 5400,
+        }
+        error = self._validate_spawn_codex(spawn_action)
+        if error:
+            self._update_pql_test_asset_claim(handoff_id, status="worker-dispatch-blocked", reason=error)
+            self._append_pending_event(f"WAKEUP_RUNNER_BLOCKED:{spawn_action['action_id']}:{error}")
+            return 3
+        exit_code = self._spawn_codex(spawn_action)
+        if exit_code == 0:
+            self._update_pql_test_asset_claim(handoff_id, status="worker-dispatched", worktree=str(worktree), branch=branch)
+            self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_WORKER_DISPATCHED:{handoff_id}:{branch}")
+        else:
+            self._update_pql_test_asset_claim(handoff_id, status="worker-dispatch-blocked", worktree=str(worktree), branch=branch, reason=f"spawn_exit_{exit_code}")
+            self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_WORKER_DISPATCH_BLOCKED:{handoff_id}:spawn_exit_{exit_code}")
+        return exit_code
+
+    def _resume_pql_test_asset_design_diff_gate(self, action: Mapping[str, Any]) -> int | None:
+        payload = self._read_pql_test_asset_claims()
+        claims = payload.get("claims")
+        if not isinstance(claims, dict):
+            return None
+        ordered_claims = sorted(
+            claims.items(),
+            key=lambda item: (
+                0 if isinstance(item[1], dict) and self._pql_claim_has_worker_marker(str(item[0]), item[1]) else 1,
+                0 if isinstance(item[1], dict) and item[1].get("status") == "worker-dispatched" else 1,
+                -self._pql_claim_log_mtime(str(item[0])),
+            ),
+        )
+        for handoff_id, claim in ordered_claims:
+            if not isinstance(claim, dict):
+                continue
+            if claim.get("status") not in {"design-gate-passed", "worker-dispatched", "diff-gate-blocked"}:
+                continue
+            handoff_path_raw = str(claim.get("handoff_path") or "")
+            worktree_raw = str(claim.get("worktree") or "")
+            if not handoff_path_raw or not worktree_raw:
+                continue
+            handoff_path = self.ctx.repo_root / handoff_path_raw if not Path(handoff_path_raw).is_absolute() else Path(handoff_path_raw)
+            worktree = Path(worktree_raw)
+            handoff = self._pql_test_asset_design_json(handoff_path, "test-design-handoff.json")
+            if not handoff:
+                continue
+            diff_gate_contract = self._pql_test_asset_design_json(handoff_path, "test-asset-design-diff-gate.json")
+            cluster_id = self._safe_pql_design_cluster_id(str(handoff_id))
+            spawn_action = {
+                "action_id": f"pql-test-asset-design-worker:{handoff_id}",
+                "log": str(self.ctx.paths.logs / f"pql-test-asset-design-worker-{cluster_id}.log"),
+            }
+            pending_reason = self._pql_test_asset_design_pending_reason(worktree, handoff, spawn_action, contract=diff_gate_contract)
+            if pending_reason:
+                self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_WORKER_PENDING:{handoff_id}:{pending_reason}")
+                if pending_reason in {"missing_clean_exit", "missing_matching_worker_marker"}:
+                    continue
+                return 0
+            diff_gate = self._pql_test_asset_design_diff_gate(worktree, handoff, spawn_action, contract=diff_gate_contract)
+            status = str(diff_gate.get("status") or "diff-gate-blocked")
+            self._update_pql_test_asset_claim(str(handoff_id), status=status, diff_gate=diff_gate, worktree=str(worktree), branch=str(claim.get("branch") or ""))
+            if status == "diff-gate-passed":
+                self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_DIFF_GATE_PASSED:{handoff_id}:{claim.get('branch', '')}")
+            else:
+                self._append_pending_event(f"PQL_TEST_ASSET_DESIGN_DIFF_GATE_BLOCKED:{handoff_id}:{diff_gate.get('reason', '')}")
+            return 0
+        return None
+
+    def _pql_claim_log_mtime(self, handoff_id: str) -> float:
+        cluster_id = self._safe_pql_design_cluster_id(handoff_id)
+        log_path = self.ctx.paths.logs / f"pql-test-asset-design-worker-{cluster_id}.log"
+        try:
+            return log_path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _pql_claim_has_worker_marker(self, handoff_id: str, claim: Mapping[str, Any]) -> bool:
+        evidence_hash = str(claim.get("evidence_hash") or "")
+        if not evidence_hash:
+            return False
+        cluster_id = self._safe_pql_design_cluster_id(handoff_id)
+        log_path = self.ctx.paths.logs / f"pql-test-asset-design-worker-{cluster_id}.log"
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        marker = f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}"
+        return any(line.strip() == marker for line in self._worker_response_lines(lines))
+
+    def _prepare_pql_current_base_snapshot(self, worktree: Path) -> None:
+        if self.ctx.repo_root.name != "product-quality-loop":
+            return
+        latest = self.command_runner(["git", "-C", str(worktree), "log", "-1", "--pretty=%s"])
+        if latest.returncode == 0 and latest.stdout.strip() == "PQL base snapshot for test asset design":
+            return
+        dirty = self.command_runner(["git", "-C", str(self.ctx.repo_root), "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        if dirty.returncode != 0 or not dirty.stdout:
+            return
+        excludes = [
+            ":(exclude).git",
+            ":(exclude).venv",
+            ":(exclude).pql",
+            ":(exclude).refactor-loop",
+            ":(exclude).worktrees",
+            ":(exclude).DS_Store",
+            ":(exclude).config/.DS_Store",
+        ]
+        diff = self.command_runner(["git", "-C", str(self.ctx.repo_root), "diff", "--binary", "HEAD", "--", ".", *excludes])
+        if diff.returncode == 0 and diff.stdout:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                handle.write(diff.stdout)
+                patch_path = handle.name
+            try:
+                self.command_runner(["git", "-C", str(worktree), "apply", "--index", patch_path])
+            finally:
+                try:
+                    os.unlink(patch_path)
+                except OSError:
+                    pass
+        untracked = self.command_runner(["git", "-C", str(self.ctx.repo_root), "ls-files", "--others", "--exclude-standard", "-z"])
+        if untracked.returncode == 0:
+            for raw in [part for part in untracked.stdout.split("\0") if part]:
+                rel = raw.replace("\\", "/")
+                if self._pql_base_snapshot_path_excluded(rel):
+                    continue
+                source = self.ctx.repo_root / rel
+                target = worktree / rel
+                if source.is_dir():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(source, target)
+                except OSError:
+                    continue
+                self.command_runner(["git", "-C", str(worktree), "add", "--", rel])
+        staged = self.command_runner(["git", "-C", str(worktree), "diff", "--cached", "--quiet"])
+        if staged.returncode == 1:
+            self.command_runner(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "-c",
+                    "user.name=consensus-rnd",
+                    "-c",
+                    "user.email=consensus-rnd@example.invalid",
+                    "commit",
+                    "-m",
+                    "PQL base snapshot for test asset design",
+                ]
+            )
+
+    def _pql_base_snapshot_path_excluded(self, rel: str) -> bool:
+        if rel in {".DS_Store", ".config/.DS_Store"}:
+            return True
+        return rel.startswith((".git/", ".venv/", ".pql/", ".refactor-loop/", ".worktrees/"))
+
+    def _pql_test_asset_design_pending_reason(self, worktree: Path, handoff: Mapping[str, Any], spawn_action: Mapping[str, Any], *, contract: Mapping[str, Any] | None = None) -> str:
+        handoff_id = str(handoff.get("handoff_id") or "")
+        evidence_hash = str(handoff.get("evidence_hash") or "")
+        log_path = Path(str(spawn_action.get("log") or ""))
+        marker = str((contract or {}).get("required_marker") or f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}")
+        marker_error = self._pql_worker_marker_error(log_path, marker)
+        if marker_error in {"missing_clean_exit", "missing_matching_worker_marker"}:
+            return marker_error
+        status_result = self.command_runner(["git", "-C", str(worktree), "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        if status_result.returncode != 0:
+            return "status_unavailable"
+        changed = self._parse_git_status_paths(status_result.stdout)
+        if not changed:
+            return "empty_diff"
+        return ""
+
+    def _safe_pql_design_cluster_id(self, handoff_id: str) -> str:
+        digest = hashlib.sha256(handoff_id.encode("utf-8")).hexdigest()[:12]
+        raw = re.sub(r"[^A-Za-z0-9._-]+", "-", handoff_id).strip("-")
+        prefix = (raw[:64] or "test-asset-design").strip("-") or "test-asset-design"
+        return f"{prefix}-{digest}"
+
+    def _pql_test_asset_design_diff_gate(self, worktree: Path, handoff: Mapping[str, Any], spawn_action: Mapping[str, Any], *, contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        handoff_id = str(handoff.get("handoff_id") or "")
+        evidence_hash = str(handoff.get("evidence_hash") or "")
+        log_path = Path(str(spawn_action.get("log") or ""))
+        blockers: list[str] = []
+        marker = str((contract or {}).get("required_marker") or f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}")
+        marker_error = self._pql_worker_marker_error(log_path, marker)
+        if marker_error:
+            blockers.append(marker_error)
+        status_result = self.command_runner(["git", "-C", str(worktree), "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        changed = self._parse_git_status_paths(status_result.stdout) if status_result.returncode == 0 else []
+        changed = self._pql_filter_validation_support_paths(worktree, changed)
+        if status_result.returncode != 0:
+            blockers.append("status_unavailable")
+        if not changed:
+            blockers.append("empty_diff")
+        allowed_patterns = [str(path) for path in (contract or {}).get("allowed_paths") or []] or self._fixed_pql_allowed_patterns(str(handoff.get("project") or "aevatar"))
+        forbidden_patterns = [str(path) for path in (contract or {}).get("forbidden_paths") or []] or self._fixed_pql_forbidden_patterns()
+        fixed_allowed = self._fixed_pql_allowed_patterns(str(handoff.get("project") or "aevatar"))
+        handoff_allowed = [str(path) for path in handoff.get("allowed_paths") or []]
+        if not handoff_allowed or any(not self._pattern_within_fixed_allowlist(pattern, fixed_allowed) for pattern in handoff_allowed):
+            blockers.append("handoff_allowed_paths_not_fixed")
+        if contract and any(not self._pattern_within_fixed_allowlist(pattern, fixed_allowed) for pattern in allowed_patterns):
+            blockers.append("diff_gate_allowed_paths_not_fixed")
+        for path in changed:
+            normalized = path.replace("\\", "/")
+            if not self._pql_path_allowed(normalized, allowed_patterns):
+                blockers.append(f"path_not_allowed:{normalized}")
+            if self._pql_path_forbidden(normalized, forbidden_patterns):
+                blockers.append(f"forbidden_path:{normalized}")
+        diff_text = self.command_runner(["git", "-C", str(worktree), "diff", "HEAD", "--"] + changed).stdout if changed else ""
+        diff_text += self._read_untracked_changed_text(worktree, changed, status_result.stdout if status_result.returncode == 0 else "")
+        design_error = self._pql_design_only_error(changed, diff_text)
+        if design_error:
+            blockers.append(design_error)
+        leak_scan_text = self._pql_leak_scan_text(diff_text)
+        if re.search(r"(/Users/|/home/|/tmp/|/private/var/|/var/folders/|[A-Za-z]:\\)", leak_scan_text, re.IGNORECASE):
+            blockers.append("local_path_or_secret_leak")
+        if re.search(r"(?i)(secret|token)\s*[:=]\s*['\"][^'\"]{8,}", leak_scan_text):
+            blockers.append("local_path_or_secret_leak")
+        validations = self._run_pql_fixed_validations(worktree)
+        for validation in validations:
+            if validation.get("returncode") != 0:
+                blockers.append(f"validation_failed:{validation.get('name')}")
+        status = "diff-gate-passed" if not blockers else "diff-gate-blocked"
+        result = {
+            "schema_version": "1.0",
+            "handoff_id": handoff_id,
+            "evidence_hash": evidence_hash,
+            "status": status,
+            "reason": blockers[0] if blockers else "",
+            "blockers": blockers,
+            "changed_paths": changed,
+            "validations": validations,
+        }
+        gate_path = self.ctx.paths.runs / f"pql-test-asset-design-diff-gate-{self._safe_pql_design_cluster_id(handoff_id)}.json"
+        gate_path.parent.mkdir(parents=True, exist_ok=True)
+        gate_path.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        return result
+
+    def _pql_worker_marker_error(self, log_path: Path, marker: str) -> str:
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "missing_clean_exit"
+        worker_lines = self._worker_response_lines(lines)
+        marker_indexes = [index for index, line in enumerate(worker_lines) if line.strip() == marker]
+        if not marker_indexes:
+            return "missing_matching_worker_marker"
+        exit_indexes = [index for index, line in enumerate(worker_lines) if line == "EXIT=0"]
+        if not exit_indexes:
+            return "missing_clean_exit"
+        if max(marker_indexes) > max(exit_indexes):
+            return "marker_after_exit"
+        return ""
+
+    def _worker_response_lines(self, lines: Sequence[str]) -> list[str]:
+        for index, line in enumerate(lines):
+            if line == "codex":
+                return list(lines[index + 1 :])
+        return list(lines)
+
+    def _parse_git_status_paths(self, text: str) -> list[str]:
+        parts = [part for part in text.split("\0") if part]
+        paths: list[str] = []
+        index = 0
+        while index < len(parts):
+            entry = parts[index]
+            if len(entry) < 4:
+                index += 1
+                continue
+            status = entry[:2]
+            path = entry[3:]
+            if path:
+                paths.append(path)
+            index += 1
+            if status[0] == "R" or status[0] == "C":
+                if index < len(parts):
+                    paths.append(parts[index])
+                    index += 1
+        return sorted(set(paths))
+
+    def _read_untracked_changed_text(self, worktree: Path, changed: Sequence[str], status_text: str = "") -> str:
+        untracked = set(self._parse_git_status_paths("\0".join(part for part in status_text.split("\0") if part.startswith("?? ")) + ("\0" if status_text else "")))
+        output: list[str] = []
+        for rel in changed:
+            if status_text and rel not in untracked:
+                continue
+            path = (worktree / rel).resolve()
+            try:
+                path.relative_to(worktree.resolve())
+            except ValueError:
+                continue
+            if not path.is_file():
+                continue
+            try:
+                output.append(path.read_text(encoding="utf-8", errors="replace")[:200000])
+            except OSError:
+                continue
+        return "\n".join(output)
+
+    def _pql_design_only_error(self, changed: Sequence[str], diff_text: str) -> str:
+        for path in changed:
+            normalized = path.replace("\\", "/")
+            if normalized.endswith(".py") and "/test-cases/" in normalized:
+                return "runtime_python_case_change"
+        for line in diff_text.splitlines():
+            normalized = line.lstrip("+ ")
+            status_match = re.match(r"(?i)['\"]?(automation_status|implementation_status)['\"]?\s*[:=]\s*['\"]?([^'\",\s#}]+)", normalized)
+            if status_match and status_match.group(2) != "design_only":
+                return "runtime_enabled_case_change"
+            runtime_match = re.match(r"(?i)['\"]?runtime_status['\"]?\s*[:=]\s*['\"]?([^'\",\s#}]+)", normalized)
+            if runtime_match and runtime_match.group(1) not in {"not_executed_design_only", "design_only"}:
+                return "runtime_enabled_case_change"
+        for line in diff_text.splitlines():
+            if line.startswith("-"):
+                continue
+            normalized = line.lstrip("+ ")
+            if normalized.lstrip().startswith("assert "):
+                continue
+            if re.search(r"(?i)(design_only\s*[:=]\s*false|mode\s*[:=]\s*[\"']?runtime|runtime\s*[:=]\s*true)", normalized):
+                return "runtime_enabled_case_change"
+        return ""
+
+    def _pql_filter_validation_support_paths(self, worktree: Path, changed: Sequence[str]) -> list[str]:
+        filtered: list[str] = []
+        for path in changed:
+            if path == ".venv" and (worktree / path).is_symlink():
+                continue
+            filtered.append(path)
+        return filtered
+
+    def _pql_leak_scan_text(self, diff_text: str) -> str:
+        lines: list[str] = []
+        for line in diff_text.splitlines():
+            if line.startswith("-"):
+                continue
+            stripped = line.lstrip("+ ")
+            if re.search(r"assert\s+['\"](/Users/|/home/|/tmp/|/private/var/|/var/folders/|[A-Za-z]:\\)", stripped):
+                continue
+            if re.search(r"assert\s+['\"]\.(pql/auth|pql/artifacts|pql/state)", stripped):
+                continue
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _run_pql_fixed_validations(self, worktree: Path) -> list[dict[str, Any]]:
+        self._ensure_pql_validation_venv_link(worktree)
+        results: list[dict[str, Any]] = []
+        for name, command in self._fixed_pql_validation_commands():
+            completed = self.command_runner(["__cwd__", str(worktree), *command])
+            results.append({"name": name, "command": command, "returncode": completed.returncode})
+        return results
+
+    def _ensure_pql_validation_venv_link(self, worktree: Path) -> None:
+        source = self.ctx.repo_root / ".venv"
+        target = worktree / ".venv"
+        if target.exists() or target.is_symlink() or not source.exists():
+            return
+        try:
+            target.symlink_to(source, target_is_directory=True)
+        except OSError:
+            return
+
+    def _pql_path_allowed(self, path: str, allowed: Sequence[str]) -> bool:
+        pure = PurePosixPath(path)
+        for pattern in allowed:
+            if self._pql_path_matches_pattern(pure, pattern):
+                return True
+        return False
+
+    def _pql_path_forbidden(self, path: str, forbidden: Sequence[str]) -> bool:
+        lowered = PurePosixPath(path.lower())
+        for pattern in forbidden:
+            if self._pql_path_matches_pattern(lowered, pattern.lower()):
+                return True
+        return False
+
+    def _pql_path_matches_pattern(self, path: PurePosixPath, pattern: str) -> bool:
+        normalized = pattern.replace("\\", "/")
+        if normalized.endswith("/**"):
+            directory = normalized[:-3].rstrip("/")
+            return path.as_posix() == directory or path.as_posix().startswith(directory + "/")
+        if fnmatch.fnmatchcase(path.as_posix(), normalized):
+            return True
+        if "/**/*" in normalized:
+            prefix, suffix = normalized.split("/**/*", 1)
+            return path.as_posix().startswith(prefix.rstrip("/") + "/") and path.as_posix().endswith(suffix)
+        if "/**/" in normalized:
+            prefix, suffix = normalized.split("/**/", 1)
+            return path.as_posix().startswith(prefix.rstrip("/") + "/") and path.as_posix().endswith("/" + suffix)
+        if "*" in normalized:
+            return PurePosixPath(path).match(normalized)
+        return path.as_posix() == normalized
+
+    def _pql_test_asset_design_json(self, handoff_path: Path, filename: str) -> dict[str, Any]:
+        path = handoff_path.parent / filename
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _validate_pql_test_asset_design_gate(self, handoff: Mapping[str, Any], gate: Mapping[str, Any]) -> str:
+        if not isinstance(gate, Mapping) or not gate:
+            return "gate_missing"
+        for key in ("handoff_id", "fingerprint"):
+            if str(gate.get(key) or "") != str(handoff.get(key) or ""):
+                return f"gate_{key}_mismatch"
+        if str(gate.get("evidence_hash") or handoff.get("evidence_hash") or "") != str(handoff.get("evidence_hash") or ""):
+            return "gate_evidence_hash_mismatch"
+        return ""
+
+    def _validate_pql_test_asset_claim_contract(self, handoff: Mapping[str, Any], claim: Mapping[str, Any]) -> str:
+        if not claim:
+            return "pql_claim_contract_missing"
+        if claim.get("contract") != "pql-test-asset-design-claim":
+            return "pql_claim_contract_bad_name"
+        if claim.get("claim_required") is not True:
+            return "pql_claim_contract_not_required"
+        status = str(claim.get("status") or "")
+        if status not in {"claimable", "blocked"}:
+            return "pql_claim_contract_bad_status"
+        for key in ("handoff_id", "fingerprint", "evidence_hash"):
+            if str(claim.get(key) or "") != str(handoff.get(key) or ""):
+                return f"pql_claim_contract_{key}_mismatch"
+        dedupe = claim.get("dedupe_keys") if isinstance(claim.get("dedupe_keys"), Mapping) else {}
+        for key in ("handoff_id", "fingerprint", "source_sha", "pql_base_sha", "evidence_hash"):
+            if str(dedupe.get(key) or "") != str(handoff.get(key) or ""):
+                return f"pql_claim_contract_dedupe_{key}_mismatch"
+        return ""
+
+    def _validate_pql_test_asset_diff_gate_contract(self, handoff: Mapping[str, Any], contract: Mapping[str, Any]) -> str:
+        if not contract:
+            return "pql_diff_gate_contract_missing"
+        if contract.get("contract") != "pql-test-asset-design-diff-gate":
+            return "pql_diff_gate_contract_bad_name"
+        if contract.get("marker_is_proof") is not False:
+            return "pql_diff_gate_marker_is_proof"
+        handoff_id = str(handoff.get("handoff_id") or "")
+        evidence_hash = str(handoff.get("evidence_hash") or "")
+        expected_marker = f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}"
+        if str(contract.get("required_marker") or "") != expected_marker:
+            return "pql_diff_gate_marker_mismatch"
+        required_checks = set(str(item) for item in contract.get("required_checks") or [])
+        for required in {
+            "worker_clean_exit",
+            "marker_present",
+            "worktree_diff_non_empty",
+            "diff_only_touches_allowed_paths",
+            "diff_does_not_touch_forbidden_paths",
+            "new_or_modified_cases_remain_design_only",
+            "handoff_id_matches_worker_output",
+            "evidence_hash_matches_worker_output",
+            "validation_commands_pass",
+            "no_local_absolute_paths_or_secrets_in_outbound_markdown",
+        }:
+            if required not in required_checks:
+                return f"pql_diff_gate_missing_check:{required}"
+        project = str(handoff.get("project") or "aevatar")
+        fixed_allowed = self._fixed_pql_allowed_patterns(project)
+        allowed = [str(path) for path in contract.get("allowed_paths") or []]
+        if not allowed or any(path not in fixed_allowed for path in allowed):
+            return "pql_diff_gate_allowed_paths_not_fixed"
+        fixed_forbidden = set(self._fixed_pql_forbidden_patterns())
+        forbidden = set(str(path) for path in contract.get("forbidden_paths") or [])
+        if not fixed_forbidden.issubset(forbidden):
+            return "pql_diff_gate_forbidden_paths_missing"
+        fixed_commands = [" ".join(command) for _name, command in self._fixed_pql_validation_commands()]
+        relative_fixed_commands = [
+            ".venv/bin/python -m pytest skills/product-quality-loop/tests -q",
+            "npm run validate",
+            "python3 skills/product-quality-loop/scripts/check_docs.py",
+            "git diff --check",
+        ]
+        commands = [str(command) for command in contract.get("validation_commands") or []]
+        if commands and commands != fixed_commands and commands != relative_fixed_commands:
+            return "pql_diff_gate_validation_commands_not_fixed"
+        return ""
+
+    def _fixed_pql_allowed_patterns(self, project: str) -> list[str]:
+        return [
+            f"project-packs/{project}/product-map.yml",
+            f"project-packs/{project}/test-selection.yml",
+            f"project-packs/{project}/test-cases/**/*.json",
+            f"project-packs/{project}/test-cases/**/*.yml",
+            f"project-packs/{project}/test-cases/**/*.yaml",
+            f"project-packs/{project}/test-cases/**/README.md",
+            "skills/product-quality-loop/tests/**",
+            "README.md",
+            "README.zh-CN.md",
+            "skills/product-quality-loop/references/**",
+        ]
+
+    def _fixed_pql_forbidden_patterns(self) -> list[str]:
+        return [
+            "aevatarAI/aevatar/**",
+            "src/**",
+            "apps/**",
+            ".pql/auth/**",
+            ".pql/state/**",
+            ".pql/artifacts/**",
+            ".pql/generated-cases/**",
+            "project-packs/*/test-cases/**/*.py",
+            "**/*token*",
+            "**/*secret*",
+        ]
+
+    def _pattern_within_fixed_allowlist(self, pattern: str, allowed: Sequence[str]) -> bool:
+        return pattern in allowed
+
+    def _fixed_pql_validation_commands(self) -> list[tuple[str, list[str]]]:
+        python = str(self.ctx.env_for_subprocess().get("PQL_PYTHON") or ".venv/bin/python")
+        python_path = Path(python).expanduser()
+        if not python_path.is_absolute():
+            python_path = self.ctx.repo_root / python_path
+        python = str(python_path)
+        return [
+            ("pytest", [python, "-m", "pytest", "skills/product-quality-loop/tests", "-q"]),
+            ("npm-validate", ["npm", "run", "validate"]),
+            ("docs", ["python3", "skills/product-quality-loop/scripts/check_docs.py"]),
+            ("diff-check", ["git", "diff", "--check"]),
+        ]
+
+    def _write_pql_test_asset_design_worker_prompt(self, handoff_path: Path, handoff: Mapping[str, Any], gate: Mapping[str, Any], *, worktree: Path) -> Path:
+        handoff_id = str(handoff.get("handoff_id") or "")
+        evidence_hash = str(handoff.get("evidence_hash") or "")
+        request_path = handoff_path.parent / "test-asset-design-request.json"
+        pql_prompt_path = handoff_path.parent / "test-asset-design-worker-prompt.md"
+        prompt_path = self.ctx.paths.prompts / f"pql-test-asset-design-{self._safe_pql_design_cluster_id(handoff_id)}.md"
+        if pql_prompt_path.is_file():
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_text = pql_prompt_path.read_text(encoding="utf-8", errors="replace")
+            if f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}" not in prompt_text:
+                raise ValueError("pql worker prompt marker mismatch")
+            prompt_path.write_text(prompt_text, encoding="utf-8")
+            return prompt_path
+        project = str(handoff.get("project") or "aevatar")
+        allowed_paths = "\n".join(f"- `{path}`" for path in self._fixed_pql_allowed_patterns(project)) or "- none"
+        forbidden_paths = "\n".join(f"- `{path}`" for path in self._fixed_pql_forbidden_patterns()) or "- none"
+        validations = "\n".join(f"- `{' '.join(command)}`" for _name, command in self._fixed_pql_validation_commands()) or "- none"
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(
+            "# PQL Test Asset Design Worker\n\n"
+            f"handoff_id: `{handoff_id}`\n"
+            f"evidence_hash: `{evidence_hash}`\n"
+            f"handoff: `{self.ctx.durable_artifact_path(handoff_path)}`\n"
+            f"design_request: `{self.ctx.durable_artifact_path(request_path)}`\n"
+            f"design_gate_status: `{gate.get('status', '')}`\n\n"
+            "Implement only design-only PQL project-pack test asset changes from the design request. "
+            "Do not create branches, commits, PRs, pushes, merges, labels, or GitHub comments. "
+            "Do not modify the target product repository or any product source files.\n\n"
+            "## Allowed Paths\n\n"
+            f"{allowed_paths}\n\n"
+            "## Forbidden Paths\n\n"
+            f"{forbidden_paths}\n\n"
+            "## Validation Commands\n\n"
+            f"{validations}\n\n"
+            "All new or changed test cases must remain `design_only`. Runtime-enabled case changes are forbidden in this worker.\n\n"
+            "Finish with exactly one marker line after validation evidence:\n\n"
+            f"PQL_TEST_ASSET_DESIGN_DONE:{handoff_id}:{evidence_hash}\n",
+            encoding="utf-8",
+        )
+        return prompt_path
 
     def _cross_instance_stand_down_reason(self, action: Mapping[str, Any]) -> str:
         controller_action = str(action.get("controller_action") or "")
@@ -2329,8 +3426,13 @@ class WakeupRunner:
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def _run_command(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        full = build_gh_argv(self.ctx.gh_repo_slug, command)
-        return subprocess.run(full, cwd=str(self.ctx.repo_root), capture_output=True, text=True, check=False)
+        cwd = self.ctx.repo_root
+        full = list(command)
+        if len(full) >= 3 and full[0] == "__cwd__":
+            cwd = Path(full[1])
+            full = full[2:]
+        full = build_gh_argv(self.ctx.gh_repo_slug, full)
+        return subprocess.run(full, cwd=str(cwd), capture_output=True, text=True, check=False)
 
     def _ledger_suppresses_retry(self, action: Mapping[str, Any]) -> bool:
         action_id = str(action.get("action_id") or "")

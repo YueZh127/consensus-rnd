@@ -57,6 +57,8 @@ KNOWN_CONTROLLER_ACTIONS = frozenset(
         "publish_release_candidate",
         "apply_issue_decomposition_plan",
         "apply_default_issue_intake_claim",
+        "run_host_product_quality_loop_test_asset_design",
+        "run_host_product_quality_loop_product_bug_issue",
     }
 )
 READ_ONLY_DISPATCH_PATTERNS = (

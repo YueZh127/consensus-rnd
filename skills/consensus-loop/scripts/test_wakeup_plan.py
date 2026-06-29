@@ -9557,6 +9557,112 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, host_actions[0])
 
+
+    def test_host_workflow_wakeup_plan_actions_project_allowlisted_pql_action(self) -> None:
+        (self.repo / "prompts").mkdir(exist_ok=True)
+        (self.repo / "prompts" / "pql.md").write_text("pql prompt\n", encoding="utf-8")
+        (self.repo / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "stages": [
+                        {
+                            "slug": "host:product-quality-loop-test-asset-design",
+                            "title": "PQL test asset design",
+                            "contract": "status projection plus fixed allowlist action",
+                        }
+                    ],
+                    "events": [
+                        {
+                            "name": "host:pql-test-asset-design-planned",
+                            "stage": "host:product-quality-loop-test-asset-design",
+                            "status": "host:planned",
+                        }
+                    ],
+                    "prompt_bindings": {"host:pql-test-asset-design-prompt": "prompts/pql.md"},
+                    "wakeup_plan_actions": [
+                        {
+                            "name": "host:product-quality-loop-test-asset-design",
+                            "event": "host:pql-test-asset-design-planned",
+                            "stage": "host:product-quality-loop-test-asset-design",
+                            "controller_action": "run_host_product_quality_loop_test_asset_design",
+                            "prompt_binding": "host:pql-test-asset-design-prompt",
+                            "interval_seconds": 3600,
+                            "preconditions": ["active_controller_owner", "pql_test_design_handoff_ready"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.repo / ".config" / "consensus-rnd").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".config" / "consensus-rnd" / "host.env").write_text(
+            f"REPO_ROOT={self.repo}\nGH_REPO_SLUG=owner/repo\nCODEX_FLOOR=5\nHOST_WORKFLOW_SPEC=workflow.json\n",
+            encoding="utf-8",
+        )
+
+        plan = self.run_plan()
+
+        action = next(item for item in plan["actions"] if item.get("controller_action") == "run_host_product_quality_loop_test_asset_design")
+        self.assertEqual(action["kind"], "host-workflow-action")
+        self.assertEqual(action["item"], "host:product-quality-loop-test-asset-design")
+        self.assertEqual(action["target_kind"], "host")
+        self.assertTrue(action["no_generic_command"])
+        self.assertNotIn("status_only", action)
+        for forbidden in ("command", "commands", "shell", "argv", "git", "gh"):
+            self.assertNotIn(forbidden, action)
+
+    def test_host_workflow_wakeup_plan_actions_project_allowlisted_pql_product_bug_issue_action(self) -> None:
+        (self.repo / "prompts").mkdir(exist_ok=True)
+        (self.repo / "prompts" / "pql.md").write_text("pql prompt\n", encoding="utf-8")
+        (self.repo / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "stages": [
+                        {
+                            "slug": "host:product-quality-loop-github-governance",
+                            "title": "PQL GitHub governance",
+                            "contract": "fixed allowlist product bug issue action",
+                        }
+                    ],
+                    "events": [
+                        {
+                            "name": "host:pql-product-bug-issue-planned",
+                            "stage": "host:product-quality-loop-github-governance",
+                            "status": "host:planned",
+                        }
+                    ],
+                    "prompt_bindings": {"host:pql-github-governance-prompt": "prompts/pql.md"},
+                    "wakeup_plan_actions": [
+                        {
+                            "name": "host:product-quality-loop-product-bug-issue",
+                            "event": "host:pql-product-bug-issue-planned",
+                            "stage": "host:product-quality-loop-github-governance",
+                            "controller_action": "run_host_product_quality_loop_product_bug_issue",
+                            "prompt_binding": "host:pql-github-governance-prompt",
+                            "interval_seconds": 3600,
+                            "preconditions": ["active_controller_owner", "pql_product_bug_handoff_ready"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.repo / ".config" / "consensus-rnd").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".config" / "consensus-rnd" / "host.env").write_text(
+            f"REPO_ROOT={self.repo}\nGH_REPO_SLUG=owner/repo\nCODEX_FLOOR=5\nHOST_WORKFLOW_SPEC=workflow.json\n",
+            encoding="utf-8",
+        )
+
+        plan = self.run_plan()
+
+        action = next(item for item in plan["actions"] if item.get("controller_action") == "run_host_product_quality_loop_product_bug_issue")
+        self.assertEqual(action["kind"], "host-workflow-action")
+        self.assertEqual(action["item"], "host:product-quality-loop-product-bug-issue")
+        self.assertEqual(action["target_kind"], "host")
+        self.assertTrue(action["no_generic_command"])
+        for forbidden in ("command", "commands", "shell", "argv", "git", "gh"):
+            self.assertNotIn(forbidden, action)
+
     def test_invalid_host_workflow_spec_is_noop_error_reason(self) -> None:
         (self.repo / "workflow.json").write_text(json.dumps({"events": [{"name": "host:x", "stage": "missing"}]}), encoding="utf-8")
         (self.repo / ".config" / "consensus-rnd").mkdir(parents=True, exist_ok=True)

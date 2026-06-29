@@ -123,6 +123,65 @@ class HostWorkflowSpecTests(unittest.TestCase):
                 stack.extend(value)
         self.assertTrue(forbidden_fields.isdisjoint(seen_keys), seen_keys & forbidden_fields)
 
+
+    def test_spec_accepts_code_allowlisted_pql_wakeup_plan_action(self) -> None:
+        data = self.valid_spec()
+        data["wakeup_plan_actions"] = [
+            {
+                "name": "host:product-quality-loop-test-asset-design",
+                "event": "host:template-ready",
+                "stage": "host:discovery",
+                "controller_action": "run_host_product_quality_loop_test_asset_design",
+                "prompt_binding": "host:solver",
+                "interval_seconds": 3600,
+                "preconditions": ["active_controller_owner", "pql_test_design_handoff_ready"],
+            }
+        ]
+
+        spec = load_validated_workflow_spec(self.ctx(self.write_spec(data)))
+
+        self.assertEqual(len(spec.wakeup_plan_actions), 1)
+        self.assertEqual(spec.wakeup_plan_actions[0].controller_action, "run_host_product_quality_loop_test_asset_design")
+        projection = spec.projection()
+        self.assertEqual(projection["wakeup_plan_actions"][0]["controller_action"], "run_host_product_quality_loop_test_asset_design")
+        self.assertNotIn("command", json.dumps(projection["wakeup_plan_actions"]))
+
+    def test_spec_accepts_code_allowlisted_pql_product_bug_issue_action(self) -> None:
+        data = self.valid_spec()
+        data["wakeup_plan_actions"] = [
+            {
+                "name": "host:product-quality-loop-product-bug-issue",
+                "event": "host:template-ready",
+                "stage": "host:discovery",
+                "controller_action": "run_host_product_quality_loop_product_bug_issue",
+                "prompt_binding": "host:solver",
+                "interval_seconds": 3600,
+                "preconditions": ["active_controller_owner", "pql_product_bug_handoff_ready"],
+            }
+        ]
+
+        spec = load_validated_workflow_spec(self.ctx(self.write_spec(data)))
+
+        self.assertEqual(len(spec.wakeup_plan_actions), 1)
+        self.assertEqual(spec.wakeup_plan_actions[0].controller_action, "run_host_product_quality_loop_product_bug_issue")
+        projection = spec.projection()
+        self.assertEqual(projection["wakeup_plan_actions"][0]["controller_action"], "run_host_product_quality_loop_product_bug_issue")
+        self.assertNotIn("command", json.dumps(projection["wakeup_plan_actions"]))
+
+    def test_spec_rejects_unallowlisted_wakeup_plan_action(self) -> None:
+        data = self.valid_spec()
+        data["wakeup_plan_actions"] = [
+            {
+                "name": "host:bad-action",
+                "event": "host:template-ready",
+                "stage": "host:discovery",
+                "controller_action": "spawn_arbitrary_shell",
+            }
+        ]
+
+        with self.assertRaisesRegex(WorkflowSpecError, "unsupported host wakeup controller action"):
+            load_validated_workflow_spec(self.ctx(self.write_spec(data)))
+
     def test_spec_rejects_absolute_parent_or_symlink_escape_paths(self) -> None:
         data = self.valid_spec()
         data["prompt_bindings"]["host:solver"] = "/tmp/outside.md"

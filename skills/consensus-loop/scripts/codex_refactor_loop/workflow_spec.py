@@ -69,6 +69,11 @@ RESERVED_NAMES = {
     *(stage.slug for stage in WORKFLOW_STAGES),
 }
 FIXED_MARKER_FAMILIES = ("SOLVER_DONE", "META_JUDGE_DONE", "META_RESOLVED")
+SUPPORTED_HOST_WAKEUP_PLAN_ACTIONS = {
+    "run_host_product_quality_loop_test_asset_design",
+    "run_host_product_quality_loop_product_bug_issue",
+}
+
 WORKFLOW_PROJECTION_KEYS = (
     "events",
     "stages",
@@ -77,6 +82,7 @@ WORKFLOW_PROJECTION_KEYS = (
     "prompt_bindings",
     "consensus_policies",
     "issue_intake_mappings",
+    "wakeup_plan_actions",
 )
 
 
@@ -114,6 +120,17 @@ class HostIssueIntakeMapping:
 
 
 @dataclass(frozen=True)
+class HostWakeupPlanAction:
+    name: str
+    event: str
+    stage: str
+    controller_action: str
+    prompt_binding: str = ""
+    interval_seconds: int = 0
+    preconditions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ValidatedWorkflowSpec:
     source_path: Path | None
     stages: tuple[WorkflowStage, ...]
@@ -123,6 +140,7 @@ class ValidatedWorkflowSpec:
     prompt_bindings: Mapping[str, str]
     consensus_policies: tuple[HostConsensusPolicy, ...]
     issue_intake_mappings: tuple[HostIssueIntakeMapping, ...]
+    wakeup_plan_actions: tuple[HostWakeupPlanAction, ...] = ()
     builtin: bool = False
 
     def stage_for_event(self, event_name: str) -> str | None:
@@ -173,6 +191,18 @@ class ValidatedWorkflowSpec:
                 }
                 for mapping in self.issue_intake_mappings
             ],
+            "wakeup_plan_actions": [
+                {
+                    "name": action.name,
+                    "event": action.event,
+                    "stage": action.stage,
+                    "controller_action": action.controller_action,
+                    "prompt_binding": action.prompt_binding,
+                    "interval_seconds": action.interval_seconds,
+                    "preconditions": list(action.preconditions),
+                }
+                for action in self.wakeup_plan_actions
+            ],
         }
 
 
@@ -208,6 +238,7 @@ class WorkflowInvariantValidator:
         events = self._parse_events(data.get("events", []), stages)
         policies = self._parse_consensus_policies(data.get("consensus_policies", []), roles, stages)
         intakes = self._parse_issue_intake_mappings(data.get("issue_intake_mappings", []), work_unit_kinds, stages, prompt_bindings)
+        wakeup_actions = self._parse_wakeup_plan_actions(data.get("wakeup_plan_actions", []), events, stages, prompt_bindings)
         return ValidatedWorkflowSpec(
             source_path=self.source_path,
             stages=tuple(stages),
@@ -217,6 +248,7 @@ class WorkflowInvariantValidator:
             prompt_bindings=dict(prompt_bindings),
             consensus_policies=tuple(policies),
             issue_intake_mappings=tuple(intakes),
+            wakeup_plan_actions=tuple(wakeup_actions),
             builtin=False,
         )
 
@@ -394,6 +426,52 @@ class WorkflowInvariantValidator:
             )
         return mappings
 
+
+    def _parse_wakeup_plan_actions(
+        self,
+        raw: Any,
+        events: Iterable[HostWorkflowEvent],
+        stages: Iterable[WorkflowStage],
+        prompt_bindings: Mapping[str, str],
+    ) -> list[HostWakeupPlanAction]:
+        event_names = {event.name for event in events}
+        stage_slugs = {stage.slug for stage in WORKFLOW_STAGES}
+        stage_slugs.update(stage.slug for stage in stages)
+        actions: list[HostWakeupPlanAction] = []
+        seen: set[str] = set()
+        for item in _items(raw, "wakeup_plan_actions"):
+            name = _string_field(item, "name")
+            self._assert_host_name(name, "wakeup plan action")
+            if name in seen:
+                raise WorkflowSpecError(f"duplicate wakeup plan action: {name}")
+            event = _string_field(item, "event")
+            if event not in event_names:
+                raise WorkflowSpecError(f"unknown wakeup plan action event: {event}")
+            stage = _string_field(item, "stage")
+            if stage not in stage_slugs:
+                raise WorkflowSpecError(f"unknown wakeup plan action stage: {stage}")
+            controller_action = _string_field(item, "controller_action")
+            if controller_action not in SUPPORTED_HOST_WAKEUP_PLAN_ACTIONS:
+                raise WorkflowSpecError(f"unsupported host wakeup controller action: {controller_action}")
+            prompt_binding = str(item.get("prompt_binding") or "")
+            if prompt_binding and prompt_binding not in prompt_bindings:
+                raise WorkflowSpecError(f"unknown wakeup plan action prompt binding: {prompt_binding}")
+            interval_seconds = _non_negative_int_field(item, "interval_seconds", default=0)
+            preconditions = tuple(_string_value(value, "preconditions") for value in _list_field(item, "preconditions", required=False))
+            actions.append(
+                HostWakeupPlanAction(
+                    name=name,
+                    event=event,
+                    stage=stage,
+                    controller_action=controller_action,
+                    prompt_binding=prompt_binding,
+                    interval_seconds=interval_seconds,
+                    preconditions=preconditions,
+                )
+            )
+            seen.add(name)
+        return actions
+
     def _assert_host_name(self, value: str, label: str) -> None:
         if value in RESERVED_NAMES or BUILTIN_NAME_RE.fullmatch(value):
             raise WorkflowSpecError(f"{label} cannot overwrite built-in vocabulary: {value}")
@@ -483,6 +561,7 @@ def builtin_workflow_spec() -> ValidatedWorkflowSpec:
                 prompt_binding="",
             ),
         ),
+        wakeup_plan_actions=(),
         builtin=True,
     )
 
@@ -499,11 +578,25 @@ def merged_with_builtin(host_spec: ValidatedWorkflowSpec) -> ValidatedWorkflowSp
         prompt_bindings={**builtin.prompt_bindings, **dict(host_spec.prompt_bindings)},
         consensus_policies=(*builtin.consensus_policies, *host_spec.consensus_policies),
         issue_intake_mappings=(*builtin.issue_intake_mappings, *host_spec.issue_intake_mappings),
+        wakeup_plan_actions=host_spec.wakeup_plan_actions,
     )
 
 
 def load_validated_workflow_spec(ctx: Any) -> ValidatedWorkflowSpec:
     return merged_with_builtin(WorkflowSpecLoader.load(ctx))
+
+
+def _non_negative_int_field(item: Mapping[str, Any], field: str, *, default: int = 0) -> int:
+    value = item.get(field, default)
+    if isinstance(value, bool):
+        raise WorkflowSpecError(f"{field} must be a non-negative integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkflowSpecError(f"{field} must be a non-negative integer") from exc
+    if number < 0:
+        raise WorkflowSpecError(f"{field} must be a non-negative integer")
+    return number
 
 
 def _repo_relative_path(repo_root: Path, text: str, label: str) -> Path:
@@ -548,10 +641,12 @@ def _string_value(value: Any, label: str) -> str:
     return value
 
 
-def _list_field(item: Any, field: str) -> list[Any]:
+def _list_field(item: Any, field: str, *, required: bool = True) -> list[Any]:
     if not isinstance(item, Mapping):
         raise WorkflowSpecError(f"{field} entry must be an object")
     value = item.get(field)
+    if value is None and not required:
+        return []
     if not isinstance(value, list):
         raise WorkflowSpecError(f"{field} must be a list")
     return value
